@@ -1,0 +1,21 @@
+# netlify.toml — tells Netlify how to build and serve StudyQuest
+
+[build]
+  command = "npm run build"
+  publish = "dist"
+  functions = "netlify/functions"
+
+# During local `netlify dev`, run Vite as the dev server
+[dev]
+  command = "npm run dev"
+  targetPort = 5173
+
+# The API function declares its own path (/api/:action) via `export const config`,
+# so no explicit redirect is needed for it. The SPA catch-all below sends every
+# non-API, non-asset route to index.html.
+
+# Single-page app: send all other routes to index.html
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200

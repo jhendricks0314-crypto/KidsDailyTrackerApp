@@ -1,0 +1,11 @@
+node_modules
+dist
+.env
+.env.local
+.netlify
+.DS_Store
+*.log
+
+# generated at build time by scripts/stamp-version.mjs
+src/version.js
+public/version.json
