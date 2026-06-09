@@ -202,3 +202,48 @@ There is one special **admin** account that can reset any parent's password
 after deploying, so no one else can claim the admin account first. For extra
 safety, set the optional `ADMIN_SETUP_KEY` environment variable — then first-run
 setup also requires that key.
+
+## Families: multiple parents, shared kids
+
+Kids belong to a **family**, and more than one parent account can share that
+family — everyone sees the same kids and progress.
+
+- When you sign up, a new family is created with a **family invite code**
+  (shown in the parent area under **👨‍👩‍👧 Family**).
+- To add a co-parent: share that code. They sign up, tick **"Join an existing
+  family"**, and enter the code. They get their own username/password but see
+  the same kids.
+- You can **regenerate** the code at any time (the old one stops working), and
+  see everyone currently in the family.
+- Treat the code like a password — only share it with people who should see
+  your kids.
+
+Existing single-parent accounts are migrated to a family automatically on next
+login, with their kids preserved.
+
+## Changing your username or password
+
+In the parent area under **⚙️ Account**, a parent can change their **username**
+(if the new one is free) and/or their **password**. (The reserved `admin`
+username can't be changed.)
+
+## Chores by day of the week
+
+In **🧹 Chores Setup**, each chore has weekday toggles (S M T W T F S) plus
+quick presets (Every day / Weekdays / Weekend). Kids only see a chore on the
+days it's scheduled, and the chore calendar reflects that.
+
+## Custom categories for every subject (including Math)
+
+You can now add your own topics to **any** subject, including Math. Built-in
+Math types (Addition, Fractions, …) are still generated locally so their
+answers are always exact; custom Math topics are written by the AI teacher like
+other subjects (and so need an internet connection).
+
+## Reward game
+
+When a child gets **every question correct** *and* finishes **all of today's
+chores**, a fun mini-game pops up as a reward (and a "Play 🎮" button stays
+available). The game is chosen by grade: a calm **Memory Match** for younger
+kids (grades 1–4) and a 20-second **Star Catcher** tap game for older kids
+(grades 5–12). The games are self-contained, so they work offline too.

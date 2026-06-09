@@ -61,6 +61,12 @@ export default async (request) => {
         return await withAuth(request, (pid) => handleVerifyPassword(pid, body));
       case "change-password":
         return await withAuth(request, (pid) => handleChangePassword(pid, body));
+      case "change-username":
+        return await withAuth(request, (pid) => handleChangeUsername(pid, body));
+      case "family-info":
+        return await withAuth(request, (pid) => handleFamilyInfo(pid));
+      case "family-regen-code":
+        return await withAuth(request, (pid) => handleFamilyRegenCode(pid));
       case "kids-list":
         return await withAuth(request, (pid) => handleKidsList(pid));
       case "kid-create":
@@ -157,12 +163,44 @@ function checkPassword(password, salt, hash) {
   return derived.length === stored.length && crypto.timingSafeEqual(derived, stored);
 }
 
+/* ------------------------------- families -------------------------------
+   Kids belong to a FAMILY, not a single parent. Multiple parent accounts can
+   belong to the same family and all see the same kids. A family has a shareable
+   join code so a co-parent can sign up into the existing family.            */
+
+function familyCode() {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no ambiguous 0/O/1/I
+  const chunk = () => Array.from({ length: 4 }, () => alphabet[crypto.randomInt(alphabet.length)]).join("");
+  return `${chunk()}-${chunk()}-${chunk()}`;
+}
+
+// Make sure a parent has a family. Existing (pre-family) accounts are migrated
+// here: a family is created and their old kids list is moved into it.
+async function ensureFamily(store, parent) {
+  if (parent.familyId) return parent.familyId;
+  const fid = uid();
+  const code = familyCode();
+  await store.setJSON(`family:${fid}`, { id: fid, code, createdAt: Date.now() });
+  await store.set(`familycode:${code}`, fid);
+  const oldKids = (await store.get(`kids:${parent.id}`, { type: "json" })) || [];
+  await store.setJSON(`kids:${fid}`, oldKids);
+  await store.setJSON(`parent:${parent.id}`, { ...parent, familyId: fid });
+  return fid;
+}
+
+async function familyIdFor(store, pid) {
+  const parent = await store.get(`parent:${pid}`, { type: "json" });
+  if (!parent) return null;
+  return ensureFamily(store, parent);
+}
+
 /* ----------------------------- auth handlers ---------------------------- */
 
 async function handleSignup(body) {
   requireSecret(); // fail early with a clear message if unset
   const username = String(body.username || "").trim();
   const password = String(body.password || "");
+  const joinCode = String(body.familyCode || "").trim().toUpperCase();
   const unameErr = validateUsername(username);
   if (unameErr) return json({ error: unameErr }, 400);
   if (username.toLowerCase() === "admin") return json({ error: "That username is reserved." }, 409);
@@ -173,17 +211,24 @@ async function handleSignup(body) {
   const existing = await store.get(`uname:${lower}`);
   if (existing) return json({ error: "That username is already taken." }, 409);
 
+  // Join an existing family by code, or start a new one.
+  let familyId;
+  if (joinCode) {
+    const fid = await store.get(`familycode:${joinCode}`);
+    if (!fid) return json({ error: "That family code wasn't found. Check it and try again." }, 404);
+    familyId = fid;
+  } else {
+    familyId = uid();
+    const code = familyCode();
+    await store.setJSON(`family:${familyId}`, { id: familyId, code, createdAt: Date.now() });
+    await store.set(`familycode:${code}`, familyId);
+    await store.setJSON(`kids:${familyId}`, []);
+  }
+
   const pid = uid();
   const { salt, hash } = hashPassword(password);
-  await store.setJSON(`parent:${pid}`, {
-    id: pid,
-    username,
-    salt,
-    hash,
-    createdAt: Date.now(),
-  });
+  await store.setJSON(`parent:${pid}`, { id: pid, username, salt, hash, familyId, createdAt: Date.now() });
   await store.set(`uname:${lower}`, pid);
-  await store.setJSON(`kids:${pid}`, []);
 
   return json({ token: signToken(pid), parent: { username, isAdmin: false } }, 200);
 }
@@ -202,12 +247,15 @@ async function handleLogin(body) {
   if (!parent || !checkPassword(password, parent.salt, parent.hash)) {
     return json({ error: "Incorrect username or password." }, 401);
   }
+  await ensureFamily(store, parent);
   return json({ token: signToken(pid), parent: { username: parent.username, isAdmin: !!parent.isAdmin } }, 200);
 }
 
 async function handleMe(pid) {
-  const parent = await db().get(`parent:${pid}`, { type: "json" });
+  const store = db();
+  const parent = await store.get(`parent:${pid}`, { type: "json" });
   if (!parent) return json({ error: "Account not found" }, 404);
+  await ensureFamily(store, parent);
   return json({ username: parent.username, isAdmin: !!parent.isAdmin }, 200);
 }
 
@@ -230,6 +278,59 @@ async function handleChangePassword(pid, body) {
   const { salt, hash } = hashPassword(next);
   await store.setJSON(`parent:${pid}`, { ...parent, salt, hash });
   return json({ ok: true }, 200);
+}
+
+async function handleChangeUsername(pid, body) {
+  const store = db();
+  const parent = await store.get(`parent:${pid}`, { type: "json" });
+  if (!parent) return json({ error: "Account not found" }, 404);
+  // the reserved admin account must keep the username "admin"
+  if (parent.isAdmin) return json({ error: "The admin username cannot be changed." }, 400);
+
+  const newU = String(body.username || "").trim();
+  const err = validateUsername(newU);
+  if (err) return json({ error: err }, 400);
+  if (newU.toLowerCase() === "admin") return json({ error: "That username is reserved." }, 409);
+
+  const oldLower = parent.username.toLowerCase();
+  const newLower = newU.toLowerCase();
+  if (newLower !== oldLower) {
+    const taken = await store.get(`uname:${newLower}`);
+    if (taken) return json({ error: "That username is already taken." }, 409);
+    await store.set(`uname:${newLower}`, pid);
+    await store.delete(`uname:${oldLower}`);
+  }
+  await store.setJSON(`parent:${pid}`, { ...parent, username: newU });
+  return json({ ok: true, username: newU }, 200);
+}
+
+async function handleFamilyInfo(pid) {
+  const store = db();
+  const parent = await store.get(`parent:${pid}`, { type: "json" });
+  if (!parent) return json({ error: "Account not found" }, 404);
+  const fid = await ensureFamily(store, parent);
+  const fam = await store.get(`family:${fid}`, { type: "json" });
+  const { blobs } = await store.list({ prefix: "parent:" });
+  const members = [];
+  for (const b of blobs) {
+    const p = await store.get(b.key, { type: "json" });
+    if (p && p.familyId === fid) members.push({ username: p.username, isAdmin: !!p.isAdmin, isYou: p.id === pid });
+  }
+  members.sort((a, b) => a.username.localeCompare(b.username));
+  return json({ code: fam ? fam.code : "", members }, 200);
+}
+
+async function handleFamilyRegenCode(pid) {
+  const store = db();
+  const parent = await store.get(`parent:${pid}`, { type: "json" });
+  if (!parent) return json({ error: "Account not found" }, 404);
+  const fid = await ensureFamily(store, parent);
+  const fam = (await store.get(`family:${fid}`, { type: "json" })) || { id: fid };
+  if (fam.code) await store.delete(`familycode:${fam.code}`);
+  const code = familyCode();
+  await store.set(`familycode:${code}`, fid);
+  await store.setJSON(`family:${fid}`, { ...fam, id: fid, code });
+  return json({ code }, 200);
 }
 
 /* ------------------------------ admin handlers -------------------------- */
@@ -258,16 +359,21 @@ async function handleAdminInit(body) {
 
   const pid = uid();
   const { salt, hash } = hashPassword(password);
+  const fid = uid();
+  const code = familyCode();
+  await store.setJSON(`family:${fid}`, { id: fid, code, createdAt: Date.now() });
+  await store.set(`familycode:${code}`, fid);
+  await store.setJSON(`kids:${fid}`, []);
   await store.setJSON(`parent:${pid}`, {
     id: pid,
     username: "admin",
     salt,
     hash,
     isAdmin: true,
+    familyId: fid,
     createdAt: Date.now(),
   });
   await store.set(`uname:admin`, pid);
-  await store.setJSON(`kids:${pid}`, []);
 
   return json({ token: signToken(pid), parent: { username: "admin", isAdmin: true } }, 200);
 }
@@ -282,7 +388,7 @@ async function handleAdminListUsers() {
     if (!p) continue;
     let kidCount = 0;
     try {
-      const kids = await store.get(`kids:${p.id}`, { type: "json" });
+      const kids = p.familyId ? await store.get(`kids:${p.familyId}`, { type: "json" }) : null;
       kidCount = Array.isArray(kids) ? kids.length : 0;
     } catch {}
     users.push({ username: p.username, isAdmin: !!p.isAdmin, kidCount, createdAt: p.createdAt || 0 });
@@ -309,12 +415,14 @@ async function handleAdminResetPassword(body) {
   return json({ ok: true, username: parent.username }, 200);
 }
 
-async function getKids(store, pid) {
-  return (await store.get(`kids:${pid}`, { type: "json" })) || [];
+async function getKids(store, familyId) {
+  return (await store.get(`kids:${familyId}`, { type: "json" })) || [];
 }
 
 async function handleKidsList(pid) {
-  const kids = await getKids(db(), pid);
+  const store = db();
+  const fid = await familyIdFor(store, pid);
+  const kids = await getKids(store, fid);
   return json({ kids: kids.map(publicKid) }, 200);
 }
 
@@ -324,18 +432,20 @@ async function handleKidCreate(pid, body) {
   if (!name) return json({ error: "Enter the child's name." }, 400);
 
   const store = db();
-  const kids = await getKids(store, pid);
+  const fid = await familyIdFor(store, pid);
+  const kids = await getKids(store, fid);
   if (kids.length >= 20) return json({ error: "Too many kids on one account." }, 400);
   const kid = { id: uid(), name, grade, createdAt: Date.now() };
   kids.push(kid);
-  await store.setJSON(`kids:${pid}`, kids);
+  await store.setJSON(`kids:${fid}`, kids);
   return json({ kid: publicKid(kid), kids: kids.map(publicKid) }, 200);
 }
 
 async function handleKidUpdate(pid, body) {
   const id = String(body.id || "");
   const store = db();
-  const kids = await getKids(store, pid);
+  const fid = await familyIdFor(store, pid);
+  const kids = await getKids(store, fid);
   const idx = kids.findIndex((k) => k.id === id);
   if (idx === -1) return json({ error: "Child not found." }, 404);
   if (typeof body.name === "string") kids[idx].name = body.name.trim().slice(0, 40) || kids[idx].name;
@@ -343,7 +453,7 @@ async function handleKidUpdate(pid, body) {
   if (body.categories && typeof body.categories === "object") {
     kids[idx].categories = sanitizeCategories(body.categories);
   }
-  await store.setJSON(`kids:${pid}`, kids);
+  await store.setJSON(`kids:${fid}`, kids);
   return json({ kids: kids.map(publicKid) }, 200);
 }
 
@@ -369,9 +479,10 @@ function sanitizeCategories(cat) {
 async function handleKidDelete(pid, body) {
   const id = String(body.id || "");
   const store = db();
-  const kids = await getKids(store, pid);
+  const fid = await familyIdFor(store, pid);
+  const kids = await getKids(store, fid);
   const next = kids.filter((k) => k.id !== id);
-  await store.setJSON(`kids:${pid}`, next);
+  await store.setJSON(`kids:${fid}`, next);
   // best-effort cleanup of that kid's data blobs
   try {
     const { blobs } = await store.list({ prefix: `d:` });
@@ -390,7 +501,7 @@ async function handleKidDelete(pid, body) {
 // Generic per-kid key/value used by the app for daily questions, chores, and
 // chore logs. Keys look like:  daily:<kidId>:<date> | chores:<kidId> | chore-log:<kidId>:<date>
 // The kidId is always the segment right after the first colon. We authorize it
-// against the parent's kid list before reading/writing.
+// against the parent's FAMILY kid list before reading/writing.
 
 async function handleData(pid, body) {
   const op = body.op;
@@ -399,7 +510,8 @@ async function handleData(pid, body) {
   if (!kidId || !isAllowedDataKey(key)) return json({ error: "Bad data key" }, 400);
 
   const store = db();
-  const kids = await getKids(store, pid);
+  const fid = await familyIdFor(store, pid);
+  const kids = await getKids(store, fid);
   if (!kids.some((k) => k.id === kidId)) {
     return json({ error: "Not authorized for this child." }, 403);
   }
