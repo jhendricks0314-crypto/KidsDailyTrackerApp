@@ -247,3 +247,129 @@ chores**, a fun mini-game pops up as a reward (and a "Play 🎮" button stays
 available). The game is chosen by grade: a calm **Memory Match** for younger
 kids (grades 1–4) and a 20-second **Star Catcher** tap game for older kids
 (grades 5–12). The games are self-contained, so they work offline too.
+
+## Update: kids' no-login link, email accounts, visual math, daily emails
+
+### 1. Kids' access link (no login)
+Parents now get a **kids' access link** (Parent area → 👨‍👩‍👧 Family). Open it on
+the child's tablet and add it to the home screen — it launches StudyQuest
+straight into your family, no password needed, so kids never need your login.
+From kid mode, tapping **🔒 Parent** asks for the parent email + password to
+reach the management area. Making a new family code revokes the old link.
+
+### 2. Reliable add/remove of kids
+The Kids manager now updates its list directly from each server response, so a
+child appears/disappears immediately after Add/Remove and errors are shown
+rather than hidden.
+
+### 3. Visual math topics
+Math now includes **Geometry, Bar Graphs, Line Graphs, Coordinate Plane, and
+Number Patterns**. These draw a small picture (shape, chart, or grid) with the
+question — on screen and on the printed sheets — and still have exact,
+auto-graded answers.
+
+### 4. Email sign-up + verification
+Accounts now use your **email address**. New sign-ups receive a verification
+link; clicking it activates the account and drops you straight into your
+family. Until verified, login is blocked (with a resend option). Changing your
+email re-triggers verification. **Requires the email env vars below.**
+
+### 5. Completion emails to parents
+Instead of a scheduled progress report, StudyQuest now emails parents **when a
+child finishes**, driven by what actually happens in the app:
+
+- **Questions done:** once a child has answered and checked **every** question
+  for the day, each verified parent gets an email listing all the questions with
+  the child's answers, the correct answer for any they missed, and the score.
+- **Chores done:** once a child completes **all of today's** chores, each parent
+  gets an email — sent **separately** (one email per parent, not a shared To
+  line).
+
+Both are sent from the server, which re-checks that the child is genuinely done
+before sending and sends **only once per child per day** for each type (so a
+page reload or re-check won't send duplicates). A per-family cap also prevents
+the endpoint from being used to spam inboxes. **Requires the email env vars
+below.** (The old 8 PM scheduled report has been removed.)
+
+### Email setup (needed for #4 and #5)
+1. Create an account at https://resend.com and **verify your sending domain**.
+2. Create an API key.
+3. In Netlify → Site configuration → Environment variables, set:
+   - `RESEND_API_KEY` — your Resend key
+   - `FROM_EMAIL` — a from address on your verified domain (e.g. `StudyQuest <no-reply@yourdomain.com>`)
+   - `APP_URL` — your site's public URL (e.g. `https://your-site.netlify.app`)
+4. Redeploy. Without these, the app runs fine but verification/completion emails
+   won't send (signup will tell you email isn't configured).
+
+> Note: the kids' link and family code are shared secrets in a URL — fine for a
+> home device. Regenerate the code to revoke access.
+
+## Installing to the home screen (PWA)
+
+StudyQuest is installable as an app. Requirements for the Android/Chrome install
+prompt are now met: the manifest ships real PNG icons (192×192 and 512×512, plus
+a maskable 512×512), a linked web manifest, and a service worker — all over
+HTTPS (Netlify provides this automatically).
+
+- **Android (Chrome):** open the site; either tap the in-app **📲 Install app**
+  button (top of the screen) or use Chrome's menu → **Add to Home screen /
+  Install app**. The button appears once Chrome confirms the site is
+  installable.
+- **iOS (Safari):** there is no automatic prompt on iOS. Tap **Share** →
+  **Add to Home Screen**. The in-app button shows these steps.
+- **Desktop (Chrome/Edge):** an install icon appears in the address bar, or use
+  the in-app button.
+
+**Note:** the install prompt only appears on the deployed HTTPS site (not over
+plain HTTP or a raw file). If you'd previously visited the site, fully close the
+tab and reopen — or clear the site data — so the browser re-reads the updated
+manifest and icons. You can confirm installability in Chrome DevTools →
+**Application → Manifest** (and the **Icons** section there shows the maskable
+safe-zone preview).
+
+## API usage controls (answer checking)
+
+Two safeguards keep Anthropic API usage (and costs) down:
+
+1. **All answers required before checking.** The "✓ Check my answers" button
+   for a subject stays disabled until every question in that subject has an
+   answer (it shows an "X/10 answered" hint). This means one grading call per
+   complete attempt instead of many calls on half-finished subjects. (Math is
+   graded locally in the browser and never calls the API at all.)
+
+2. **Per-family rate limits.** The three AI endpoints — answer grading,
+   question generation, and teacher help — are each capped per family (shared
+   across all parents and the kids' link), over a rolling per-minute and
+   per-day window. Going over returns a friendly "you're checking too fast"
+   message and a short wait, rather than an error. Defaults (tunable via the
+   `RL_*` environment variables in `.env.example`):
+
+   | Endpoint            | Per minute | Per day |
+   |---------------------|-----------:|--------:|
+   | Grade answers       |         20 |     400 |
+   | Generate questions  |         10 |     150 |
+   | Teacher help        |         15 |     250 |
+
+   These are generous for normal daily use by a household but stop a stuck or
+   mischievous child (or a leaked link) from looping calls. Limits are enforced
+   on the server, so they can't be bypassed from the browser.
+
+## Celebration pop-ups
+
+When a child aces a subject (every question correct) or finishes all of today's
+chores, a fun full-screen congratulations pops up. There are **10 different
+celebrations** ("Perfect Score!", "Woohoo!", "Blast Off!", "Superstar!",
+"Magical!", "Bullseye!", "Way to Go!", "Amazing Job!", "Big Brain!", "On
+Fire!"), each with its own emoji, colors, emoji animation, and particle effect
+(raining emojis, bursting sparks, or rising confetti). A random one is shown
+each time (never the same one twice in a row), so it stays fresh. These are
+pure CSS/emoji, so they work offline and inside the installed app.
+
+## Question generation is once-per-day (and never wasted)
+
+Each child's question set is generated **once per calendar day** and then reused
+all day — answering, checking, and reloading never create a new set. A stored
+set that already has questions is always kept and **never regenerated**, even if
+it's barely started (well under 50% answered). Combined with "all answers
+required before checking" and the per-family rate limits, this keeps Anthropic
+API calls to roughly one generation per child per day.

@@ -8,7 +8,15 @@
 
 const VERSION = "__BUILD_ID__";
 const CACHE = `studyquest-${VERSION}`;
-const APP_SHELL = ["/", "/index.html", "/manifest.webmanifest"];
+const APP_SHELL = [
+  "/",
+  "/index.html",
+  "/manifest.webmanifest",
+  "/icon-192.png",
+  "/icon-512.png",
+  "/icon-maskable-512.png",
+  "/apple-touch-icon.png",
+];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(

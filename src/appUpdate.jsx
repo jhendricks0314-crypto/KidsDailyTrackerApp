@@ -148,3 +148,125 @@ export function UpdateBanner({ onUpdate }) {
     </div>
   );
 }
+
+/* ------------------------------------------------------------------ *
+ * Install ("Add to Home screen") support
+ *
+ * Chrome/Edge/Android fire `beforeinstallprompt` when the PWA meets the
+ * install criteria. We capture it and expose a promptInstall() so the app
+ * can show its own "Install app" button (more reliable than waiting for the
+ * browser's mini-infobar, which it often suppresses).
+ *
+ * iOS Safari has no prompt event — installing is manual via the Share menu —
+ * so we detect iOS and surface short instructions instead.
+ * ------------------------------------------------------------------ */
+export function isStandalone() {
+  if (typeof window === "undefined") return false;
+  return (
+    window.matchMedia?.("(display-mode: standalone)").matches ||
+    window.navigator.standalone === true // iOS
+  );
+}
+
+function isIOS() {
+  if (typeof navigator === "undefined") return false;
+  const ua = navigator.userAgent || "";
+  const iOSDevice = /iPad|iPhone|iPod/.test(ua);
+  // iPadOS 13+ reports as Mac but has touch
+  const iPadOS = navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1;
+  return iOSDevice || iPadOS;
+}
+
+export function useInstallPrompt() {
+  const deferredRef = useRef(null);
+  const [canInstall, setCanInstall] = useState(false);
+  const [installed, setInstalled] = useState(isStandalone());
+  const ios = isIOS();
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const onBeforeInstall = (e) => {
+      e.preventDefault(); // stop the mini-infobar; we'll show our own button
+      deferredRef.current = e;
+      setCanInstall(true);
+    };
+    const onInstalled = () => {
+      setInstalled(true);
+      setCanInstall(false);
+      deferredRef.current = null;
+    };
+
+    window.addEventListener("beforeinstallprompt", onBeforeInstall);
+    window.addEventListener("appinstalled", onInstalled);
+    const mq = window.matchMedia?.("(display-mode: standalone)");
+    const onDisplayChange = (e) => setInstalled(e.matches);
+    mq?.addEventListener?.("change", onDisplayChange);
+
+    return () => {
+      window.removeEventListener("beforeinstallprompt", onBeforeInstall);
+      window.removeEventListener("appinstalled", onInstalled);
+      mq?.removeEventListener?.("change", onDisplayChange);
+    };
+  }, []);
+
+  const promptInstall = useCallback(async () => {
+    const e = deferredRef.current;
+    if (!e) return false;
+    e.prompt();
+    try {
+      await e.userChoice;
+    } catch {}
+    deferredRef.current = null;
+    setCanInstall(false);
+    return true;
+  }, []);
+
+  // Show the button when the browser offered a prompt, or on iOS (manual),
+  // as long as we're not already running as an installed app.
+  const showInstall = !installed && (canInstall || ios);
+  return { showInstall, canInstall, installed, ios, promptInstall };
+}
+
+export function InstallButton() {
+  const { showInstall, canInstall, ios, promptInstall } = useInstallPrompt();
+  const [showHelp, setShowHelp] = useState(false);
+  if (!showInstall) return null;
+
+  return (
+    <>
+      <button
+        className="sq-install-btn"
+        onClick={() => (canInstall ? promptInstall() : setShowHelp(true))}
+      >
+        📲 Install app
+      </button>
+      {showHelp && ios && (
+        <div className="sq-overlay" onClick={() => setShowHelp(false)}>
+          <div
+            className="sq-card"
+            style={{ maxWidth: 360, width: "100%", padding: 24, borderRadius: 18, textAlign: "center" }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div style={{ fontSize: 40 }}>📲</div>
+            <h2 style={{ fontFamily: "'Fredoka', sans-serif", color: "#4a3f5e", margin: "8px 0" }}>
+              Install StudyQuest
+            </h2>
+            <p style={{ color: "#6a5f7e", lineHeight: 1.5 }}>
+              In Safari, tap the <strong>Share</strong> button{" "}
+              <span aria-hidden="true">⬆️</span>, then choose{" "}
+              <strong>“Add to Home Screen”</strong>.
+            </p>
+            <button
+              className="sq-install-btn"
+              style={{ marginTop: 8 }}
+              onClick={() => setShowHelp(false)}
+            >
+              Got it
+            </button>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}

@@ -44,45 +44,55 @@ export default async (request) => {
 
   try {
     switch (action) {
-      // --- auth / first-run (no token required) ---
+      // --- auth / first-run / public (no token required) ---
       case "signup":
         return await handleSignup(body);
       case "login":
         return await handleLogin(body);
+      case "verify-email":
+        return await handleVerifyEmail(body);
+      case "resend-verification":
+        return await handleResendVerification(body);
+      case "family-access":
+        return await handleFamilyAccess(body);
       case "admin-status":
         return await handleAdminStatus();
       case "admin-init":
         return await handleAdminInit(body);
 
-      // --- everything below requires a valid token ---
-      case "me":
-        return await withAuth(request, (pid) => handleMe(pid));
-      case "verify-password":
-        return await withAuth(request, (pid) => handleVerifyPassword(pid, body));
-      case "change-password":
-        return await withAuth(request, (pid) => handleChangePassword(pid, body));
-      case "change-username":
-        return await withAuth(request, (pid) => handleChangeUsername(pid, body));
-      case "family-info":
-        return await withAuth(request, (pid) => handleFamilyInfo(pid));
-      case "family-regen-code":
-        return await withAuth(request, (pid) => handleFamilyRegenCode(pid));
+      // --- shared: a logged-in parent OR a family device link ---
       case "kids-list":
-        return await withAuth(request, (pid) => handleKidsList(pid));
-      case "kid-create":
-        return await withAuth(request, (pid) => handleKidCreate(pid, body));
-      case "kid-update":
-        return await withAuth(request, (pid) => handleKidUpdate(pid, body));
-      case "kid-delete":
-        return await withAuth(request, (pid) => handleKidDelete(pid, body));
+        return await withAuthAny(request, (auth) => handleKidsList(auth));
       case "data":
-        return await withAuth(request, (pid) => handleData(pid, body));
+        return await withAuthAny(request, (auth) => handleData(auth, body));
       case "grade":
-        return await withAuth(request, (pid) => handleGrade(body));
+        return await withAuthAny(request, (auth) => handleGrade(auth, body));
       case "generate":
-        return await withAuth(request, (pid) => handleGenerate(body));
+        return await withAuthAny(request, (auth) => handleGenerate(auth, body));
       case "help":
-        return await withAuth(request, (pid) => handleHelp(body));
+        return await withAuthAny(request, (auth) => handleHelp(auth, body));
+      case "notify":
+        return await withAuthAny(request, (auth) => handleNotify(auth, body));
+
+      // --- parent only (managing the account / kids / family) ---
+      case "me":
+        return await withParent(request, (auth) => handleMe(auth));
+      case "verify-password":
+        return await withParent(request, (auth) => handleVerifyPassword(auth, body));
+      case "change-password":
+        return await withParent(request, (auth) => handleChangePassword(auth, body));
+      case "change-email":
+        return await withParent(request, (auth) => handleChangeEmail(auth, body));
+      case "family-info":
+        return await withParent(request, (auth) => handleFamilyInfo(auth));
+      case "family-regen-code":
+        return await withParent(request, (auth) => handleFamilyRegenCode(auth));
+      case "kid-create":
+        return await withParent(request, (auth) => handleKidCreate(auth, body));
+      case "kid-update":
+        return await withParent(request, (auth) => handleKidUpdate(auth, body));
+      case "kid-delete":
+        return await withParent(request, (auth) => handleKidDelete(auth, body));
 
       // --- admin only (token + isAdmin re-checked server-side) ---
       case "admin-list-users":
@@ -115,39 +125,82 @@ function signToken(pid) {
   return `${payload}.${sig}`;
 }
 
-function verifyToken(token) {
+// Long-lived token for a family device link (kids use this; no login needed).
+// Includes the family's access nonce so the parent can revoke all device links.
+function signFamilyToken(fid, nonce) {
+  const secret = requireSecret();
+  const payload = b64url(JSON.stringify({ fid, kind: "family", n: nonce || 0, exp: Date.now() + 1000 * 60 * 60 * 24 * 365 }));
+  const sig = b64url(crypto.createHmac("sha256", secret).update(payload).digest());
+  return `${payload}.${sig}`;
+}
+
+// Returns the decoded payload if the signature + expiry are valid, else null.
+function verifyTokenData(token) {
   if (!token || typeof token !== "string" || !token.includes(".")) return null;
   const secret = requireSecret();
   const [payload, sig] = token.split(".");
   const expected = b64url(crypto.createHmac("sha256", secret).update(payload).digest());
-  // constant-time compare
   const a = Buffer.from(sig);
   const b = Buffer.from(expected);
   if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
   try {
     const data = JSON.parse(Buffer.from(payload.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString());
-    if (!data.pid || !data.exp || Date.now() > data.exp) return null;
-    return data.pid;
+    if (!data.exp || Date.now() > data.exp) return null;
+    return data;
   } catch {
     return null;
   }
 }
 
-async function withAuth(request, fn) {
-  const header = request.headers.get("authorization") || "";
-  const token = header.startsWith("Bearer ") ? header.slice(7) : "";
-  const pid = verifyToken(token);
-  if (!pid) return json({ error: "Not authenticated" }, 401);
-  return fn(pid);
+function verifyToken(token) {
+  const d = verifyTokenData(token);
+  return d && d.pid ? d.pid : null;
 }
 
-// Like withAuth, but also confirms the account is the admin (flag is read from
-// storage every time — a token alone can never grant admin powers).
+// Resolve a request's bearer token into an auth context.
+// Parent token -> { kind:"parent", pid, parent, fid }
+// Family token -> { kind:"family", fid }   (kid-mode device link)
+async function resolveAuth(request) {
+  const header = request.headers.get("authorization") || "";
+  const token = header.startsWith("Bearer ") ? header.slice(7) : "";
+  const data = verifyTokenData(token);
+  if (!data) return null;
+  const store = db();
+  if (data.kind === "family") {
+    if (!data.fid) return null;
+    const fam = await store.get(`family:${data.fid}`, { type: "json" });
+    if (!fam) return null;
+    if ((data.n || 0) !== (fam.accessNonce || 0)) return null; // link was revoked
+    return { kind: "family", fid: data.fid };
+  }
+  if (!data.pid) return null;
+  const parent = await store.get(`parent:${data.pid}`, { type: "json" });
+  if (!parent) return null;
+  const fid = await ensureFamily(store, parent);
+  return { kind: "parent", pid: data.pid, parent, fid };
+}
+
+// Any authenticated caller (a logged-in parent OR a family device link).
+// Used for endpoints kids need: list kids, read/write data, generate, grade, help.
+async function withAuthAny(request, fn) {
+  const auth = await resolveAuth(request);
+  if (!auth) return json({ error: "Not authenticated" }, 401);
+  return fn(auth);
+}
+
+// Parent-only endpoints (managing kids, account, family, answer keys).
+async function withParent(request, fn) {
+  const auth = await resolveAuth(request);
+  if (!auth) return json({ error: "Not authenticated" }, 401);
+  if (auth.kind !== "parent") return json({ error: "Parent login required" }, 403);
+  return fn(auth);
+}
+
+// Admin-only (parent token whose account has isAdmin).
 async function withAdmin(request, fn) {
-  return withAuth(request, async (pid) => {
-    const parent = await db().get(`parent:${pid}`, { type: "json" });
-    if (!parent || !parent.isAdmin) return json({ error: "Admin access required" }, 403);
-    return fn(pid, parent);
+  return withParent(request, async (auth) => {
+    if (!auth.parent || !auth.parent.isAdmin) return json({ error: "Admin access required" }, 403);
+    return fn(auth);
   });
 }
 
@@ -180,7 +233,7 @@ async function ensureFamily(store, parent) {
   if (parent.familyId) return parent.familyId;
   const fid = uid();
   const code = familyCode();
-  await store.setJSON(`family:${fid}`, { id: fid, code, createdAt: Date.now() });
+  await store.setJSON(`family:${fid}`, { id: fid, code, accessNonce: 0, createdAt: Date.now() });
   await store.set(`familycode:${code}`, fid);
   const oldKids = (await store.get(`kids:${parent.id}`, { type: "json" })) || [];
   await store.setJSON(`kids:${fid}`, oldKids);
@@ -188,28 +241,29 @@ async function ensureFamily(store, parent) {
   return fid;
 }
 
-async function familyIdFor(store, pid) {
-  const parent = await store.get(`parent:${pid}`, { type: "json" });
-  if (!parent) return null;
-  return ensureFamily(store, parent);
-}
-
 /* ----------------------------- auth handlers ---------------------------- */
 
+// Accounts are identified by email. New accounts start unverified; the parent
+// must click a link emailed to them before they can log in.
 async function handleSignup(body) {
-  requireSecret(); // fail early with a clear message if unset
-  const username = String(body.username || "").trim();
+  requireSecret();
+  const email = normEmail(body.email || body.username); // accept either field name
   const password = String(body.password || "");
   const joinCode = String(body.familyCode || "").trim().toUpperCase();
-  const unameErr = validateUsername(username);
-  if (unameErr) return json({ error: unameErr }, 400);
-  if (username.toLowerCase() === "admin") return json({ error: "That username is reserved." }, 409);
+  if (!isEmail(email)) return json({ error: "Enter a valid email address." }, 400);
   if (password.length < 6) return json({ error: "Password must be at least 6 characters." }, 400);
 
   const store = db();
-  const lower = username.toLowerCase();
-  const existing = await store.get(`uname:${lower}`);
-  if (existing) return json({ error: "That username is already taken." }, 409);
+  const existingPid = await store.get(`uname:${email}`);
+  if (existingPid) {
+    // If the existing account is unverified, allow re-sending instead of erroring out.
+    const existing = await store.get(`parent:${existingPid}`, { type: "json" });
+    if (existing && !existing.verified) {
+      await sendVerificationEmail(store, existing);
+      return json({ pending: true, email, resent: true }, 200);
+    }
+    return json({ error: "An account with that email already exists. Try logging in." }, 409);
+  }
 
   // Join an existing family by code, or start a new one.
   let familyId;
@@ -220,116 +274,163 @@ async function handleSignup(body) {
   } else {
     familyId = uid();
     const code = familyCode();
-    await store.setJSON(`family:${familyId}`, { id: familyId, code, createdAt: Date.now() });
+    await store.setJSON(`family:${familyId}`, { id: familyId, code, accessNonce: 0, createdAt: Date.now() });
     await store.set(`familycode:${code}`, familyId);
     await store.setJSON(`kids:${familyId}`, []);
   }
 
   const pid = uid();
   const { salt, hash } = hashPassword(password);
-  await store.setJSON(`parent:${pid}`, { id: pid, username, salt, hash, familyId, createdAt: Date.now() });
-  await store.set(`uname:${lower}`, pid);
+  await store.setJSON(`parent:${pid}`, {
+    id: pid,
+    username: email, // identifier is the email
+    email,
+    salt,
+    hash,
+    familyId,
+    verified: false,
+    createdAt: Date.now(),
+  });
+  await store.set(`uname:${email}`, pid);
 
-  return json({ token: signToken(pid), parent: { username, isAdmin: false } }, 200);
+  const sent = await sendVerificationEmail(store, { id: pid, email });
+  return json({ pending: true, email, emailConfigured: sent.configured, devLink: sent.devLink || undefined }, 200);
 }
 
 async function handleLogin(body) {
   requireSecret();
-  const username = String(body.username || "").trim();
+  const email = normEmail(body.email || body.username);
   const password = String(body.password || "");
-  if (!username || !password) return json({ error: "Enter your username and password." }, 400);
+  if (!email || !password) return json({ error: "Enter your email and password." }, 400);
 
   const store = db();
-  const pid = await store.get(`uname:${username.toLowerCase()}`);
-  if (!pid) return json({ error: "Incorrect username or password." }, 401);
+  // allow the special admin to log in by "admin" (not an email)
+  const lookup = email === "admin" ? "admin" : email;
+  const pid = await store.get(`uname:${lookup}`);
+  if (!pid) return json({ error: "Incorrect email or password." }, 401);
 
   const parent = await store.get(`parent:${pid}`, { type: "json" });
   if (!parent || !checkPassword(password, parent.salt, parent.hash)) {
-    return json({ error: "Incorrect username or password." }, 401);
+    return json({ error: "Incorrect email or password." }, 401);
+  }
+  if (!parent.isAdmin && !parent.verified) {
+    return json({ error: "Please verify your email first. Check your inbox for the link.", unverified: true, email: parent.email }, 403);
   }
   await ensureFamily(store, parent);
-  return json({ token: signToken(pid), parent: { username: parent.username, isAdmin: !!parent.isAdmin } }, 200);
+  return json({ token: signToken(pid), parent: publicParent(parent) }, 200);
 }
 
-async function handleMe(pid) {
+// Click-through from the verification email.
+async function handleVerifyEmail(body) {
+  requireSecret();
+  const token = String(body.token || "");
+  const data = verifyTokenData(token);
+  if (!data || data.kind !== "verify" || !data.pid) return json({ error: "This verification link is invalid or has expired." }, 400);
   const store = db();
-  const parent = await store.get(`parent:${pid}`, { type: "json" });
-  if (!parent) return json({ error: "Account not found" }, 404);
-  await ensureFamily(store, parent);
-  return json({ username: parent.username, isAdmin: !!parent.isAdmin }, 200);
+  const parent = await store.get(`parent:${data.pid}`, { type: "json" });
+  if (!parent) return json({ error: "Account not found." }, 404);
+  if (!parent.verified) {
+    await store.setJSON(`parent:${parent.id}`, { ...parent, verified: true });
+  }
+  await ensureFamily(store, { ...parent, verified: true });
+  // log them straight in
+  return json({ token: signToken(parent.id), parent: publicParent({ ...parent, verified: true }) }, 200);
 }
 
-async function handleVerifyPassword(pid, body) {
-  const parent = await db().get(`parent:${pid}`, { type: "json" });
-  if (!parent) return json({ error: "Account not found" }, 404);
-  const ok = checkPassword(String(body.password || ""), parent.salt, parent.hash);
+async function handleResendVerification(body) {
+  requireSecret();
+  const email = normEmail(body.email);
+  if (!isEmail(email)) return json({ error: "Enter a valid email address." }, 400);
+  const store = db();
+  const pid = await store.get(`uname:${email}`);
+  // Always respond the same way so we don't reveal whether an email is registered.
+  if (pid) {
+    const parent = await store.get(`parent:${pid}`, { type: "json" });
+    if (parent && !parent.verified) await sendVerificationEmail(store, parent);
+  }
+  return json({ ok: true }, 200);
+}
+
+// Exchange a family invite code for a long-lived family (kid-mode) token.
+// This is what the no-login "kids' link" uses.
+async function handleFamilyAccess(body) {
+  requireSecret();
+  const code = String(body.code || "").trim().toUpperCase();
+  if (!code) return json({ error: "Missing family code." }, 400);
+  const store = db();
+  const fid = await store.get(`familycode:${code}`);
+  if (!fid) return json({ error: "That family link is invalid. Ask a parent for the current one." }, 404);
+  const fam = await store.get(`family:${fid}`, { type: "json" });
+  const nonce = (fam && fam.accessNonce) || 0;
+  return json({ token: signFamilyToken(fid, nonce) }, 200);
+}
+
+async function handleMe(auth) {
+  return json({ parent: publicParent(auth.parent) }, 200);
+}
+
+async function handleVerifyPassword(auth, body) {
+  const ok = checkPassword(String(body.password || ""), auth.parent.salt, auth.parent.hash);
   return json({ ok }, ok ? 200 : 401);
 }
 
-async function handleChangePassword(pid, body) {
+async function handleChangePassword(auth, body) {
   const store = db();
-  const parent = await store.get(`parent:${pid}`, { type: "json" });
-  if (!parent) return json({ error: "Account not found" }, 404);
+  const parent = auth.parent;
   if (!checkPassword(String(body.current || ""), parent.salt, parent.hash)) {
     return json({ error: "Current password is incorrect." }, 401);
   }
   const next = String(body.next || "");
   if (next.length < 6) return json({ error: "New password must be at least 6 characters." }, 400);
   const { salt, hash } = hashPassword(next);
-  await store.setJSON(`parent:${pid}`, { ...parent, salt, hash });
+  await store.setJSON(`parent:${parent.id}`, { ...parent, salt, hash });
   return json({ ok: true }, 200);
 }
 
-async function handleChangeUsername(pid, body) {
+// Changing email requires re-verifying the new address.
+async function handleChangeEmail(auth, body) {
   const store = db();
-  const parent = await store.get(`parent:${pid}`, { type: "json" });
-  if (!parent) return json({ error: "Account not found" }, 404);
-  // the reserved admin account must keep the username "admin"
-  if (parent.isAdmin) return json({ error: "The admin username cannot be changed." }, 400);
+  const parent = auth.parent;
+  if (parent.isAdmin) return json({ error: "The admin account email cannot be changed." }, 400);
+  const newEmail = normEmail(body.email);
+  if (!isEmail(newEmail)) return json({ error: "Enter a valid email address." }, 400);
+  const oldEmail = (parent.email || parent.username || "").toLowerCase();
+  if (newEmail === oldEmail) return json({ error: "That's already your email." }, 400);
+  const taken = await store.get(`uname:${newEmail}`);
+  if (taken) return json({ error: "Another account already uses that email." }, 409);
 
-  const newU = String(body.username || "").trim();
-  const err = validateUsername(newU);
-  if (err) return json({ error: err }, 400);
-  if (newU.toLowerCase() === "admin") return json({ error: "That username is reserved." }, 409);
-
-  const oldLower = parent.username.toLowerCase();
-  const newLower = newU.toLowerCase();
-  if (newLower !== oldLower) {
-    const taken = await store.get(`uname:${newLower}`);
-    if (taken) return json({ error: "That username is already taken." }, 409);
-    await store.set(`uname:${newLower}`, pid);
-    await store.delete(`uname:${oldLower}`);
-  }
-  await store.setJSON(`parent:${pid}`, { ...parent, username: newU });
-  return json({ ok: true, username: newU }, 200);
+  // move the index, set unverified, and send a fresh verification email
+  await store.set(`uname:${newEmail}`, parent.id);
+  await store.delete(`uname:${oldEmail}`);
+  const updated = { ...parent, email: newEmail, username: newEmail, verified: false };
+  await store.setJSON(`parent:${parent.id}`, updated);
+  await sendVerificationEmail(store, updated);
+  return json({ ok: true, email: newEmail, mustReverify: true }, 200);
 }
 
-async function handleFamilyInfo(pid) {
+async function handleFamilyInfo(auth) {
   const store = db();
-  const parent = await store.get(`parent:${pid}`, { type: "json" });
-  if (!parent) return json({ error: "Account not found" }, 404);
-  const fid = await ensureFamily(store, parent);
+  const fid = auth.fid;
   const fam = await store.get(`family:${fid}`, { type: "json" });
   const { blobs } = await store.list({ prefix: "parent:" });
   const members = [];
   for (const b of blobs) {
     const p = await store.get(b.key, { type: "json" });
-    if (p && p.familyId === fid) members.push({ username: p.username, isAdmin: !!p.isAdmin, isYou: p.id === pid });
+    if (p && p.familyId === fid) members.push({ email: p.email || p.username, isAdmin: !!p.isAdmin, isYou: p.id === auth.pid, verified: !!p.verified || !!p.isAdmin });
   }
-  members.sort((a, b) => a.username.localeCompare(b.username));
+  members.sort((a, b) => a.email.localeCompare(b.email));
   return json({ code: fam ? fam.code : "", members }, 200);
 }
 
-async function handleFamilyRegenCode(pid) {
+// Regenerate the family code AND revoke existing kid-device links.
+async function handleFamilyRegenCode(auth) {
   const store = db();
-  const parent = await store.get(`parent:${pid}`, { type: "json" });
-  if (!parent) return json({ error: "Account not found" }, 404);
-  const fid = await ensureFamily(store, parent);
+  const fid = auth.fid;
   const fam = (await store.get(`family:${fid}`, { type: "json" })) || { id: fid };
   if (fam.code) await store.delete(`familycode:${fam.code}`);
   const code = familyCode();
   await store.set(`familycode:${code}`, fid);
-  await store.setJSON(`family:${fid}`, { ...fam, id: fid, code });
+  await store.setJSON(`family:${fid}`, { ...fam, id: fid, code, accessNonce: ((fam.accessNonce || 0) + 1) });
   return json({ code }, 200);
 }
 
@@ -361,21 +462,23 @@ async function handleAdminInit(body) {
   const { salt, hash } = hashPassword(password);
   const fid = uid();
   const code = familyCode();
-  await store.setJSON(`family:${fid}`, { id: fid, code, createdAt: Date.now() });
+  await store.setJSON(`family:${fid}`, { id: fid, code, accessNonce: 0, createdAt: Date.now() });
   await store.set(`familycode:${code}`, fid);
   await store.setJSON(`kids:${fid}`, []);
   await store.setJSON(`parent:${pid}`, {
     id: pid,
     username: "admin",
+    email: "admin",
     salt,
     hash,
     isAdmin: true,
+    verified: true,
     familyId: fid,
     createdAt: Date.now(),
   });
   await store.set(`uname:admin`, pid);
 
-  return json({ token: signToken(pid), parent: { username: "admin", isAdmin: true } }, 200);
+  return json({ token: signToken(pid), parent: publicParent({ username: "admin", isAdmin: true, verified: true }) }, 200);
 }
 
 // List every parent account (admin view). Never returns password hashes.
@@ -391,48 +494,48 @@ async function handleAdminListUsers() {
       const kids = p.familyId ? await store.get(`kids:${p.familyId}`, { type: "json" }) : null;
       kidCount = Array.isArray(kids) ? kids.length : 0;
     } catch {}
-    users.push({ username: p.username, isAdmin: !!p.isAdmin, kidCount, createdAt: p.createdAt || 0 });
+    users.push({ email: p.email || p.username, isAdmin: !!p.isAdmin, verified: !!p.verified || !!p.isAdmin, kidCount, createdAt: p.createdAt || 0 });
   }
-  users.sort((a, b) => (a.isAdmin === b.isAdmin ? a.username.localeCompare(b.username) : a.isAdmin ? -1 : 1));
+  users.sort((a, b) => (a.isAdmin === b.isAdmin ? a.email.localeCompare(b.email) : a.isAdmin ? -1 : 1));
   return json({ users }, 200);
 }
 
-// Admin sets a new password for a target account (by username).
+// Admin sets a new password for a target account (by email).
 async function handleAdminResetPassword(body) {
-  const username = String(body.username || "").trim();
+  const target = normEmail(body.email || body.username);
   const newPassword = String(body.newPassword || "");
-  if (!username) return json({ error: "Which user?" }, 400);
+  if (!target) return json({ error: "Which user?" }, 400);
   if (newPassword.length < 6) return json({ error: "New password must be at least 6 characters." }, 400);
 
   const store = db();
-  const pid = await store.get(`uname:${username.toLowerCase()}`);
-  if (!pid) return json({ error: "No account with that username." }, 404);
+  const lookup = target === "admin" ? "admin" : target;
+  const pid = await store.get(`uname:${lookup}`);
+  if (!pid) return json({ error: "No account with that email." }, 404);
   const parent = await store.get(`parent:${pid}`, { type: "json" });
   if (!parent) return json({ error: "Account not found." }, 404);
 
   const { salt, hash } = hashPassword(newPassword);
   await store.setJSON(`parent:${pid}`, { ...parent, salt, hash });
-  return json({ ok: true, username: parent.username }, 200);
+  return json({ ok: true, email: parent.email || parent.username }, 200);
 }
 
 async function getKids(store, familyId) {
   return (await store.get(`kids:${familyId}`, { type: "json" })) || [];
 }
 
-async function handleKidsList(pid) {
+async function handleKidsList(auth) {
   const store = db();
-  const fid = await familyIdFor(store, pid);
-  const kids = await getKids(store, fid);
+  const kids = await getKids(store, auth.fid);
   return json({ kids: kids.map(publicKid) }, 200);
 }
 
-async function handleKidCreate(pid, body) {
+async function handleKidCreate(auth, body) {
   const name = String(body.name || "").trim().slice(0, 40);
   const grade = clampGrade(body.grade);
   if (!name) return json({ error: "Enter the child's name." }, 400);
 
   const store = db();
-  const fid = await familyIdFor(store, pid);
+  const fid = auth.fid;
   const kids = await getKids(store, fid);
   if (kids.length >= 20) return json({ error: "Too many kids on one account." }, 400);
   const kid = { id: uid(), name, grade, createdAt: Date.now() };
@@ -441,10 +544,10 @@ async function handleKidCreate(pid, body) {
   return json({ kid: publicKid(kid), kids: kids.map(publicKid) }, 200);
 }
 
-async function handleKidUpdate(pid, body) {
+async function handleKidUpdate(auth, body) {
   const id = String(body.id || "");
   const store = db();
-  const fid = await familyIdFor(store, pid);
+  const fid = auth.fid;
   const kids = await getKids(store, fid);
   const idx = kids.findIndex((k) => k.id === id);
   if (idx === -1) return json({ error: "Child not found." }, 404);
@@ -476,10 +579,10 @@ function sanitizeCategories(cat) {
   return { selected: clean(cat.selected), custom: clean(cat.custom) };
 }
 
-async function handleKidDelete(pid, body) {
+async function handleKidDelete(auth, body) {
   const id = String(body.id || "");
   const store = db();
-  const fid = await familyIdFor(store, pid);
+  const fid = auth.fid;
   const kids = await getKids(store, fid);
   const next = kids.filter((k) => k.id !== id);
   await store.setJSON(`kids:${fid}`, next);
@@ -501,16 +604,16 @@ async function handleKidDelete(pid, body) {
 // Generic per-kid key/value used by the app for daily questions, chores, and
 // chore logs. Keys look like:  daily:<kidId>:<date> | chores:<kidId> | chore-log:<kidId>:<date>
 // The kidId is always the segment right after the first colon. We authorize it
-// against the parent's FAMILY kid list before reading/writing.
+// against the FAMILY kid list (works for both a parent login and a kid device link).
 
-async function handleData(pid, body) {
+async function handleData(auth, body) {
   const op = body.op;
   const key = String(body.key || "");
   const kidId = keyKidId(key);
   if (!kidId || !isAllowedDataKey(key)) return json({ error: "Bad data key" }, 400);
 
   const store = db();
-  const fid = await familyIdFor(store, pid);
+  const fid = auth.fid;
   const kids = await getKids(store, fid);
   if (!kids.some((k) => k.id === kidId)) {
     return json({ error: "Not authorized for this child." }, 403);
@@ -538,7 +641,9 @@ function isAllowedDataKey(key) {
 
 /* ------------------------------ grade handler --------------------------- */
 
-async function handleGrade(body) {
+async function handleGrade(auth, body) {
+  const rl = await checkRateLimit(auth, "grade");
+  if (rl) return rl;
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return json({ error: "Server is missing ANTHROPIC_API_KEY" }, 500);
 
@@ -642,7 +747,9 @@ function stripFences(text) {
 /* --------------------------- question generation ------------------------ */
 // Generates short-answer questions for one or more non-math subjects, drawn
 // from the parent-selected categories. Used for built-in AND custom topics.
-async function handleGenerate(body) {
+async function handleGenerate(auth, body) {
+  const rl = await checkRateLimit(auth, "generate");
+  if (rl) return rl;
   const grade = Number(body.grade) || 1;
   const requests = Array.isArray(body.requests) ? body.requests : null;
   if (!requests || requests.length === 0) return json({ error: "Expected { grade, requests[] }" }, 400);
@@ -699,7 +806,9 @@ async function handleGenerate(body) {
 /* ------------------------------ teacher help ---------------------------- */
 // After a child misses a question several times, explain it like a patient
 // teacher and guide them to the answer.
-async function handleHelp(body) {
+async function handleHelp(auth, body) {
+  const rl = await checkRateLimit(auth, "help");
+  if (rl) return rl;
   const subject = String(body.subject || "").slice(0, 80);
   const grade = Number(body.grade) || 1;
   const question = String(body.question || "").slice(0, 500);
@@ -726,6 +835,182 @@ async function handleHelp(body) {
   return json({ help: text.slice(0, 800) }, 200);
 }
 
+/* --------------------- completion notification emails ------------------- */
+// When a kid finishes their questions, or finishes all of today's chores, email
+// each verified parent. The condition is re-checked here against stored data
+// (we don't just trust the client), and a per-kid/day flag prevents duplicates.
+
+const NOTIFY_SUBJECTS = ["Math", "Reading & Writing", "Science", "History", "Geography"];
+
+function choreAppliesOnDate(c, dateKey) {
+  if (!Array.isArray(c.days) || c.days.length === 0) return true;
+  const [y, m, d] = String(dateKey).split("-").map(Number);
+  if (!y || !m || !d) return true;
+  const dow = new Date(Date.UTC(y, m - 1, d)).getUTCDay();
+  return c.days.includes(dow);
+}
+
+async function handleNotify(auth, body) {
+  const rl = await checkRateLimit(auth, "notify");
+  if (rl) return rl;
+
+  const type = String(body.type || "");
+  const kidId = String(body.kidId || "");
+  const date = String(body.date || "");
+  if (!["questions", "chores"].includes(type)) return json({ error: "Bad notify type" }, 400);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return json({ error: "Bad date" }, 400);
+
+  const store = db();
+  const kids = await getKids(store, auth.fid);
+  const kid = kids.find((k) => k.id === kidId);
+  if (!kid) return json({ error: "Not authorized for this child." }, 403);
+
+  // Already sent for this kid/day/type?
+  const flagKey = `notify:${type}:${kidId}:${date}`;
+  try {
+    if (await store.get(flagKey)) return json({ alreadySent: true }, 200);
+  } catch {}
+
+  // Build the email, validating the completion condition against stored data.
+  let subject, html, text;
+  if (type === "questions") {
+    const day = await store.get(`d:daily:${kidId}:${date}`, { type: "json" });
+    if (!day) return json({ notReady: true }, 200);
+    let total = 0, checked = 0, right = 0;
+    for (const s of NOTIFY_SUBJECTS) {
+      for (const it of day[s] || []) {
+        total++;
+        if (it.checked) checked++;
+        if (it.correct === true) right++;
+      }
+    }
+    if (total === 0 || checked < total) return json({ notReady: true }, 200); // not done yet
+    ({ subject, html, text } = buildQuestionsEmail(kid, day, right, total, date));
+  } else {
+    const chores = (await store.get(`d:chores:${kidId}`, { type: "json" })) || [];
+    const todays = chores.filter((c) => choreAppliesOnDate(c, date));
+    if (todays.length === 0) return json({ notReady: true }, 200);
+    const log = (await store.get(`d:chore-log:${kidId}:${date}`, { type: "json" })) || {};
+    const allDone = todays.every((c) => (log[c.id] || {}).completed === "yes");
+    if (!allDone) return json({ notReady: true }, 200);
+    ({ subject, html, text } = buildChoresEmail(kid, todays, log, date));
+  }
+
+  // Verified, non-admin parents in this family.
+  const { blobs } = await store.list({ prefix: "parent:" });
+  const recipients = [];
+  for (const b of blobs) {
+    const p = await store.get(b.key, { type: "json" });
+    if (p && p.familyId === auth.fid && !p.isAdmin && p.verified && p.email) recipients.push(p.email);
+  }
+  if (recipients.length === 0) return json({ sent: 0, noRecipients: true }, 200);
+
+  // Mark sent BEFORE dispatching to minimize duplicate windows.
+  try {
+    await store.set(flagKey, String(Date.now()));
+  } catch {}
+
+  // One SEPARATE email per parent.
+  let sent = 0;
+  let configured = true;
+  for (const to of recipients) {
+    const res = await sendEmail({ to, subject, html, text });
+    configured = res.configured;
+    if (res.ok) sent++;
+  }
+  if (!configured) {
+    // Email isn't set up — clear the flag so it can send once configured.
+    try {
+      await store.delete(flagKey);
+    } catch {}
+    return json({ sent: 0, emailConfigured: false }, 200);
+  }
+  return json({ sent, emailConfigured: true }, 200);
+}
+
+function esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+}
+
+function buildQuestionsEmail(kid, day, right, total, date) {
+  const pct = total > 0 ? Math.round((right / total) * 100) : 0;
+  const blocks = NOTIFY_SUBJECTS.map((s) => {
+    const list = day[s] || [];
+    if (!list.length) return "";
+    const rows = list
+      .map((it, i) => {
+        const ok = it.correct === true;
+        const child = esc(it.response || "—");
+        const correct = esc(it.a || "");
+        const showCorrect = !ok && correct ? ` &nbsp; <span style="color:#2f7a45">✔ Answer: ${correct}</span>` : "";
+        const fig = it.svg ? ` <span style="color:#9a8fb0">(has a diagram in the app)</span>` : "";
+        return (
+          `<li style="margin:0 0 10px">` +
+          `<div style="color:#2b2438">${i + 1}. ${esc(it.q)}${fig}</div>` +
+          `<div style="font-size:14px">${ok ? "✅" : "❌"} <strong>${esc(kid.name)}:</strong> ${child}${showCorrect}</div>` +
+          `</li>`
+        );
+      })
+      .join("");
+    return `<h3 style="color:#4a3f5e;margin:18px 0 6px;font-family:system-ui,sans-serif">${esc(s)}</h3><ul style="padding-left:18px;margin:0">${rows}</ul>`;
+  }).join("");
+
+  const subject = `${kid.name} finished today's questions — ${right}/${total} correct`;
+  const html =
+    `<div style="font-family:system-ui,sans-serif;max-width:600px;margin:0 auto;padding:20px;color:#2b2438">` +
+    `<h1 style="color:#4a3f5e">🎓 ${esc(kid.name)} completed today's questions</h1>` +
+    `<p style="color:#7a6f8c">${esc(prettyDate(date))} · Grade ${kid.grade} · scored <strong>${right}/${total}</strong> (${pct}%).</p>` +
+    blocks +
+    `<p style="color:#a99fb8;font-size:12px;margin-top:18px">Sent by StudyQuest when your child finished their questions.</p>` +
+    `</div>`;
+  const textLines = [`${kid.name} finished today's questions — ${right}/${total} correct (${pct}%)`, prettyDate(date), ""];
+  for (const s of NOTIFY_SUBJECTS) {
+    const list = day[s] || [];
+    if (!list.length) continue;
+    textLines.push(`== ${s} ==`);
+    list.forEach((it, i) => {
+      textLines.push(`${i + 1}. ${it.q}`);
+      textLines.push(`   ${it.correct === true ? "[correct]" : "[x]"} ${kid.name}: ${it.response || "—"}`);
+      if (it.correct !== true && it.a) textLines.push(`   answer: ${it.a}`);
+    });
+    textLines.push("");
+  }
+  return { subject, html, text: textLines.join("\n") };
+}
+
+function buildChoresEmail(kid, todays, log, date) {
+  const items = todays
+    .map((c) => {
+      const e = log[c.id] || {};
+      const note = e.blockers ? ` <span style="color:#9a8fb0">— note: ${esc(e.blockers)}</span>` : "";
+      return `<li style="margin:4px 0">✅ ${esc(c.title)}${note}</li>`;
+    })
+    .join("");
+  const subject = `${kid.name} finished all of today's chores! 🎉`;
+  const html =
+    `<div style="font-family:system-ui,sans-serif;max-width:560px;margin:0 auto;padding:20px;color:#2b2438">` +
+    `<h1 style="color:#4a3f5e">🧹 ${esc(kid.name)} finished all chores</h1>` +
+    `<p style="color:#7a6f8c">${esc(prettyDate(date))} — all ${todays.length} chore${todays.length === 1 ? "" : "s"} done. 🎉</p>` +
+    `<ul style="padding-left:18px">${items}</ul>` +
+    `<p style="color:#a99fb8;font-size:12px;margin-top:18px">Sent by StudyQuest when your child completed their chores.</p>` +
+    `</div>`;
+  const text =
+    `${kid.name} finished all of today's chores! (${prettyDate(date)})\n\n` +
+    todays.map((c) => `- ${c.title}${(log[c.id] || {}).blockers ? ` (note: ${log[c.id].blockers})` : ""}`).join("\n");
+  return { subject, html, text };
+}
+
+function prettyDate(dateKey) {
+  const [y, m, d] = String(dateKey).split("-").map(Number);
+  if (!y) return dateKey;
+  return new Date(Date.UTC(y, m - 1, d)).toLocaleDateString("en-US", {
+    weekday: "long",
+    month: "short",
+    day: "numeric",
+    timeZone: "UTC",
+  });
+}
+
 function gradeLabel(g) {
   return g <= 5 ? "elementary school" : g <= 8 ? "middle school" : "high school";
 }
@@ -733,14 +1018,18 @@ function gradeLabel(g) {
 function publicKid(k) {
   return { id: k.id, name: k.name, grade: k.grade, categories: k.categories || null };
 }
+function publicParent(p) {
+  return { email: p.email || p.username, isAdmin: !!p.isAdmin, verified: !!p.verified || !!p.isAdmin };
+}
 function clampGrade(g) {
   const n = Math.round(Number(g) || 1);
   return Math.max(1, Math.min(12, n));
 }
-function validateUsername(u) {
-  if (u.length < 3 || u.length > 30) return "Username must be 3–30 characters.";
-  if (!/^[a-zA-Z0-9._-]+$/.test(u)) return "Username can use letters, numbers, dots, dashes, underscores.";
-  return null;
+function normEmail(v) {
+  return String(v || "").trim().toLowerCase();
+}
+function isEmail(v) {
+  return typeof v === "string" && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v) && v.length <= 254;
 }
 function uid() {
   return crypto.randomBytes(9).toString("base64url");
@@ -751,10 +1040,139 @@ function b64url(input) {
 function json(obj, status) {
   return new Response(JSON.stringify(obj), { status, headers: { "content-type": "application/json" } });
 }
+
+/* ----------------------------- rate limiting ----------------------------
+   The AI endpoints (grade / generate / help) cost an Anthropic API call each,
+   so we cap how often a single FAMILY can call them. Two rolling windows are
+   enforced per action: a short burst window and a daily window. Counters live
+   in Blobs keyed by family + action + window bucket, and expire naturally as
+   buckets roll over (old buckets are simply never read again).
+
+   Limits are generous for real use but stop runaway/abusive looping. They can
+   be tuned with env vars without a code change.                              */
+const RL = {
+  grade: {
+    perMin: Number(process.env.RL_GRADE_PER_MIN) || 20,
+    perDay: Number(process.env.RL_GRADE_PER_DAY) || 400,
+  },
+  generate: {
+    perMin: Number(process.env.RL_GENERATE_PER_MIN) || 10,
+    perDay: Number(process.env.RL_GENERATE_PER_DAY) || 150,
+  },
+  help: {
+    perMin: Number(process.env.RL_HELP_PER_MIN) || 15,
+    perDay: Number(process.env.RL_HELP_PER_DAY) || 250,
+  },
+  // Completion emails (questions done / chores done). Generous for a household
+  // but stops anyone from looping the endpoint to spam parents' inboxes.
+  notify: {
+    perMin: Number(process.env.RL_NOTIFY_PER_MIN) || 6,
+    perDay: Number(process.env.RL_NOTIFY_PER_DAY) || 40,
+  },
+};
+
+// Returns null if allowed, or a 429 Response if the family is over a limit.
+// `auth.fid` scopes the limit to the whole family (shared across parents+kids).
+async function checkRateLimit(auth, action) {
+  const conf = RL[action];
+  if (!conf || !auth || !auth.fid) return null;
+  const store = db();
+  const now = Date.now();
+  const minuteBucket = Math.floor(now / 60000); // changes every minute
+  const dayBucket = Math.floor(now / 86400000); // changes every day (UTC)
+
+  const windows = [
+    { key: `rl:${auth.fid}:${action}:m:${minuteBucket}`, limit: conf.perMin, retry: 60 - Math.floor((now % 60000) / 1000) },
+    { key: `rl:${auth.fid}:${action}:d:${dayBucket}`, limit: conf.perDay, retry: 3600 },
+  ];
+
+  // First pass: read current counts; if any window is already at the limit, reject.
+  const counts = [];
+  for (const w of windows) {
+    let n = 0;
+    try {
+      n = Number(await store.get(w.key)) || 0;
+    } catch {
+      n = 0;
+    }
+    counts.push(n);
+    if (n >= w.limit) {
+      return json(
+        {
+          error: "You're checking a bit too fast. Please wait a moment and try again.",
+          rateLimited: true,
+          retryAfter: w.retry,
+        },
+        429
+      );
+    }
+  }
+
+  // Allowed: increment both windows. (Last-write-wins under rare races is fine
+  // for a soft limit — at worst a family gets a couple extra calls.)
+  await Promise.all(windows.map((w, i) => store.set(w.key, String(counts[i] + 1))));
+  return null;
+}
+
 async function safeText(res) {
   try {
     return (await res.text()).slice(0, 300);
   } catch {
     return "";
   }
+}
+
+/* ------------------------------- email ---------------------------------- */
+// Public base URL of the app, used to build links in emails.
+function siteUrl() {
+  return (process.env.APP_URL || process.env.URL || "").replace(/\/$/, "");
+}
+
+// Send an email via Resend (https://resend.com). Returns { ok, configured }.
+// If RESEND_API_KEY / FROM_EMAIL aren't set, this is a no-op (configured:false)
+// so the rest of the app keeps working without email set up.
+async function sendEmail({ to, subject, html, text }) {
+  const key = process.env.RESEND_API_KEY;
+  const from = process.env.FROM_EMAIL;
+  if (!key || !from) return { ok: false, configured: false };
+  try {
+    const res = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
+      body: JSON.stringify({ from, to: [to], subject, html, text }),
+    });
+    return { ok: res.ok, configured: true };
+  } catch {
+    return { ok: false, configured: true };
+  }
+}
+
+function signVerifyToken(pid) {
+  const secret = requireSecret();
+  const payload = b64url(JSON.stringify({ pid, kind: "verify", exp: Date.now() + 1000 * 60 * 60 * 48 })); // 48h
+  const sig = b64url(crypto.createHmac("sha256", secret).update(payload).digest());
+  return `${payload}.${sig}`;
+}
+
+// Build + send the verification email. Returns { configured, devLink? }.
+// In a dev environment (ALLOW_DEV_VERIFY_LINK=1) the link is also returned in
+// the API response so it can be tested without an email provider.
+async function sendVerificationEmail(store, parent) {
+  const token = signVerifyToken(parent.id);
+  const base = siteUrl() || "";
+  const link = `${base}/?verify=${encodeURIComponent(token)}`;
+  const subject = "Verify your StudyQuest email";
+  const html =
+    `<div style="font-family:system-ui,sans-serif;max-width:480px;margin:0 auto;padding:24px;color:#2b2438">` +
+    `<h1 style="color:#4a3f5e">Welcome to StudyQuest 🎓</h1>` +
+    `<p>Tap the button below to verify your email and activate your family account.</p>` +
+    `<p style="text-align:center;margin:28px 0"><a href="${link}" style="background:#4a3f5e;color:#fff;text-decoration:none;font-weight:700;padding:12px 24px;border-radius:12px">Verify my email</a></p>` +
+    `<p style="color:#7a6f8c;font-size:13px">If the button doesn't work, paste this link into your browser:<br>${link}</p>` +
+    `<p style="color:#7a6f8c;font-size:13px">This link expires in 48 hours. If you didn't sign up, you can ignore this email.</p>` +
+    `</div>`;
+  const text = `Welcome to StudyQuest! Verify your email to activate your account: ${link}`;
+  const sent = await sendEmail({ to: parent.email, subject, html, text });
+  const out = { configured: sent.configured };
+  if (process.env.ALLOW_DEV_VERIFY_LINK === "1") out.devLink = link;
+  return out;
 }

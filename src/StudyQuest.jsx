@@ -1,5 +1,5 @@
-import React, { useState, useEffect, useCallback } from "react";
-import { useAppUpdate, UpdateBanner } from "./appUpdate.jsx";
+import React, { useState, useEffect, useCallback, useRef } from "react";
+import { useAppUpdate, UpdateBanner, InstallButton } from "./appUpdate.jsx";
 
 /* =========================================================================
    StudyQuest — daily questions + chores tracker for kids
@@ -27,6 +27,22 @@ const fmtDate = (key) => {
 
 const uid = () => Math.random().toString(36).slice(2, 10);
 
+// Remove ?verify= / ?family= from the address bar after we've consumed them,
+// so a refresh or shared screenshot doesn't re-trigger or leak the code.
+const cleanUrl = () => {
+  try {
+    const url = new URL(window.location.href);
+    let changed = false;
+    for (const p of ["verify", "family"]) {
+      if (url.searchParams.has(p)) {
+        url.searchParams.delete(p);
+        changed = true;
+      }
+    }
+    if (changed) window.history.replaceState({}, "", url.pathname + url.search + url.hash);
+  } catch {}
+};
+
 const rint = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
 const pick = (arr) => arr[rint(0, arr.length - 1)];
 
@@ -39,21 +55,47 @@ const norm = (s) =>
     .replace(/\s+/g, " ");
 
 /* ------------------------- backend API client --------------------------
-   Data now lives on the server (Netlify Function + Blobs), scoped to the
-   logged-in parent. The browser keeps only a signed session token.        */
+   Data lives on the server (Netlify Function + Blobs). The browser keeps a
+   signed token: either a PARENT token (full account) or a FAMILY token (the
+   no-login "kids' link" — read/write kid data only).                        */
 
-const TOKEN_KEY = "sq-token";
-let authToken = typeof window !== "undefined" ? window.localStorage.getItem(TOKEN_KEY) : null;
+const TOKEN_KEY = "sq-token"; // parent session token
+const FAMILY_TOKEN_KEY = "sq-family-token"; // kid-mode device token
+
+const ls = (k) => {
+  try {
+    return window.localStorage.getItem(k);
+  } catch {
+    return null;
+  }
+};
+let parentToken = typeof window !== "undefined" ? ls(TOKEN_KEY) : null;
+let familyToken = typeof window !== "undefined" ? ls(FAMILY_TOKEN_KEY) : null;
 
 function setToken(t) {
-  authToken = t || null;
+  parentToken = t || null;
   try {
     if (t) window.localStorage.setItem(TOKEN_KEY, t);
     else window.localStorage.removeItem(TOKEN_KEY);
   } catch {}
 }
+function setFamilyToken(t) {
+  familyToken = t || null;
+  try {
+    if (t) window.localStorage.setItem(FAMILY_TOKEN_KEY, t);
+    else window.localStorage.removeItem(FAMILY_TOKEN_KEY);
+  } catch {}
+}
 function getToken() {
-  return authToken;
+  return parentToken;
+}
+function getFamilyToken() {
+  return familyToken;
+}
+// The active bearer token: a logged-in parent takes priority; otherwise the
+// family (kid-mode) token if present.
+function activeToken() {
+  return parentToken || familyToken;
 }
 
 // low-level request to /api/<action>
@@ -62,7 +104,7 @@ async function apiRequest(action, body) {
     method: "POST",
     headers: {
       "content-type": "application/json",
-      ...(authToken ? { authorization: `Bearer ${authToken}` } : {}),
+      ...(activeToken() ? { authorization: `Bearer ${activeToken()}` } : {}),
     },
     body: JSON.stringify(body || {}),
   });
@@ -72,33 +114,51 @@ async function apiRequest(action, body) {
   } catch {}
   if (res.status === 401) {
     // session invalid/expired -> sign out everywhere
-    setToken(null);
     if (typeof window !== "undefined") window.dispatchEvent(new Event("sq-unauthorized"));
   }
   if (!res.ok) {
     const err = new Error((data && data.error) || `Request failed (${res.status})`);
     err.status = res.status;
+    err.data = data || {};
     throw err;
   }
   return data;
 }
 
 const api = {
-  async signup(username, password, familyCode) {
-    const r = await apiRequest("signup", { username, password, familyCode });
+  // Returns { pending, email, ... } — account must be verified by email.
+  async signup(email, password, familyCode) {
+    return apiRequest("signup", { email, password, familyCode });
+  },
+  // Returns the parent object on success; throws with err.data.unverified if not verified.
+  async login(email, password) {
+    const r = await apiRequest("login", { email, password });
     setToken(r.token);
     return r.parent;
   },
-  async login(username, password) {
-    const r = await apiRequest("login", { username, password });
+  async verifyEmail(token) {
+    const r = await apiRequest("verify-email", { token });
     setToken(r.token);
     return r.parent;
+  },
+  async resendVerification(email) {
+    return apiRequest("resend-verification", { email });
+  },
+  // Exchange a family code for a kid-mode token (the no-login link).
+  async familyAccess(code) {
+    const r = await apiRequest("family-access", { code });
+    setFamilyToken(r.token);
+    return true;
   },
   logout() {
     setToken(null);
   },
+  exitFamily() {
+    setFamilyToken(null);
+  },
   async me() {
-    return apiRequest("me");
+    const r = await apiRequest("me");
+    return r.parent;
   },
   async verifyPassword(password) {
     try {
@@ -111,9 +171,8 @@ const api = {
   async changePassword(current, next) {
     return apiRequest("change-password", { current, next });
   },
-  async changeUsername(username) {
-    const r = await apiRequest("change-username", { username });
-    return r && r.username;
+  async changeEmail(email) {
+    return apiRequest("change-email", { email });
   },
   async familyInfo() {
     return apiRequest("family-info");
@@ -146,6 +205,10 @@ const api = {
     const r = await apiRequest("help", payload);
     return (r && r.help) || "";
   },
+  // Fire-and-forget completion email trigger (questions done / chores done).
+  async notify(type, kidId, date) {
+    return apiRequest("notify", { type, kidId, date });
+  },
   // --- admin / first-run ---
   async adminStatus() {
     return apiRequest("admin-status");
@@ -159,8 +222,8 @@ const api = {
     const r = await apiRequest("admin-list-users");
     return (r && r.users) || [];
   },
-  async adminResetPassword(username, newPassword) {
-    return apiRequest("admin-reset-password", { username, newPassword });
+  async adminResetPassword(email, newPassword) {
+    return apiRequest("admin-reset-password", { email, newPassword });
   },
 };
 
@@ -197,7 +260,7 @@ const store = {
 // Built-in categories per subject. Math categories map to procedural
 // generators (answers always exact). Other subjects pass these to the AI.
 const SUBJECT_CATEGORIES = {
-  Math: ["Addition", "Subtraction", "Multiplication", "Division", "Fractions", "Word Problems", "Exponents & Powers", "Algebra"],
+  Math: ["Addition", "Subtraction", "Multiplication", "Division", "Fractions", "Word Problems", "Exponents & Powers", "Algebra", "Geometry", "Bar Graphs", "Line Graphs", "Coordinate Plane", "Number Patterns"],
   "Reading & Writing": ["Vocabulary", "Synonyms & Antonyms", "Grammar", "Parts of Speech", "Spelling", "Literary Devices"],
   Science: ["Life Science", "Earth & Space", "Physical Science", "The Human Body", "Animals & Plants", "Weather"],
   History: ["U.S. History", "World History", "Ancient Civilizations", "Famous People", "Inventions"],
@@ -206,8 +269,8 @@ const SUBJECT_CATEGORIES = {
 // Math categories that work for a given grade (keeps young kids on basics)
 function mathCategoriesForGrade(grade) {
   const all = SUBJECT_CATEGORIES.Math;
-  if (grade <= 2) return ["Addition", "Subtraction"];
-  if (grade <= 5) return ["Addition", "Subtraction", "Multiplication", "Division", "Fractions", "Word Problems"];
+  if (grade <= 2) return ["Addition", "Subtraction", "Bar Graphs", "Number Patterns"];
+  if (grade <= 5) return ["Addition", "Subtraction", "Multiplication", "Division", "Fractions", "Word Problems", "Geometry", "Bar Graphs", "Line Graphs", "Number Patterns"];
   return all;
 }
 
@@ -263,7 +326,159 @@ const MATH_GEN = {
     const x = rint(2, 20), c = rint(1, 30), m = rint(2, 9);
     return { type: "math", q: `Solve for x: ${m}x + ${c} = ${m * x + c}`, a: String(x) };
   },
+  Geometry(g) {
+    const r = rint(1, 3);
+    if (r === 1) {
+      // count sides of a polygon (with a drawing)
+      const shapes = [
+        { n: 3, name: "triangle" },
+        { n: 4, name: "square" },
+        { n: 5, name: "pentagon" },
+        { n: 6, name: "hexagon" },
+        { n: 8, name: "octagon" },
+      ];
+      const s = pick(g <= 3 ? shapes.slice(0, 3) : shapes);
+      return { type: "math", q: `How many sides does this shape have?`, a: String(s.n), svg: svgPolygon(s.n) };
+    }
+    if (r === 2) {
+      // rectangle area with labeled sides
+      const w = rint(2, 12), hgt = rint(2, 9);
+      return { type: "math", q: `What is the AREA of this rectangle? (length × width)`, a: String(w * hgt), svg: svgRectangle(w, hgt) };
+    }
+    // rectangle perimeter
+    const w = rint(2, 12), hgt = rint(2, 9);
+    return { type: "math", q: `What is the PERIMETER of this rectangle? (add all four sides)`, a: String(2 * (w + hgt)), svg: svgRectangle(w, hgt) };
+  },
+  "Bar Graphs"(g) {
+    const labels = ["Mon", "Tue", "Wed", "Thu", "Fri"].slice(0, g <= 3 ? 4 : 5);
+    const data = labels.map((l) => ({ label: l, value: rint(1, 10) }));
+    const mode = pick(["read", "max", "min", "total"]);
+    if (mode === "read") {
+      const pickIdx = rint(0, data.length - 1);
+      return { type: "math", q: `On the graph, what value is shown for ${data[pickIdx].label}?`, a: String(data[pickIdx].value), svg: svgBarChart(data) };
+    }
+    if (mode === "max") {
+      const top = data.reduce((a, b) => (b.value > a.value ? b : a));
+      return { type: "math", q: `Which day has the HIGHEST bar? (write the day)`, a: top.label, accept: [top.label, top.label.toLowerCase()], svg: svgBarChart(data) };
+    }
+    if (mode === "min") {
+      const low = data.reduce((a, b) => (b.value < a.value ? b : a));
+      return { type: "math", q: `Which day has the LOWEST bar? (write the day)`, a: low.label, accept: [low.label, low.label.toLowerCase()], svg: svgBarChart(data) };
+    }
+    const total = data.reduce((s, d) => s + d.value, 0);
+    return { type: "math", q: `What is the TOTAL of all the bars added together?`, a: String(total), svg: svgBarChart(data) };
+  },
+  "Line Graphs"(g) {
+    const labels = ["1", "2", "3", "4", "5"];
+    const data = labels.map((l) => ({ label: l, value: rint(1, 10) }));
+    const mode = pick(["read", "max"]);
+    if (mode === "max") {
+      const top = data.reduce((a, b) => (b.value > a.value ? b : a));
+      return { type: "math", q: `At which x-value is the line the HIGHEST?`, a: top.label, svg: svgLineChart(data) };
+    }
+    const pickIdx = rint(0, data.length - 1);
+    return { type: "math", q: `On the line graph, what is the value when x = ${data[pickIdx].label}?`, a: String(data[pickIdx].value), svg: svgLineChart(data) };
+  },
+  "Coordinate Plane"() {
+    const x = rint(1, 5), y = rint(1, 5);
+    const which = pick(["x", "y"]);
+    return {
+      type: "math",
+      q: `What is the ${which}-coordinate of point A?`,
+      a: String(which === "x" ? x : y),
+      svg: svgCoordPoint(x, y),
+    };
+  },
+  "Number Patterns"(g) {
+    const start = rint(1, 9);
+    const step = rint(2, g <= 3 ? 5 : 9);
+    const kind = pick(["add", g <= 3 ? "add" : "mult"]);
+    if (kind === "mult") {
+      const seq = [start, start * step, start * step * step, start * step * step * step];
+      return { type: "math", q: `What number comes next? ${seq.slice(0, 3).join(", ")}, ___`, a: String(seq[3]) };
+    }
+    const seq = [start, start + step, start + 2 * step, start + 3 * step, start + 4 * step];
+    return { type: "math", q: `What number comes next? ${seq.slice(0, 4).join(", ")}, ___`, a: String(seq[4]) };
+  },
 };
+
+/* ---- tiny SVG builders for visual math (self-contained, print-safe) ---- */
+function svgWrap(inner, w = 240, h = 170) {
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}" width="100%" style="max-width:${w}px;height:auto;background:#fff;border:1px solid #eee;border-radius:10px">${inner}</svg>`;
+}
+function svgPolygon(n) {
+  const cx = 120, cy = 85, r = 60;
+  const pts = [];
+  for (let i = 0; i < n; i++) {
+    const ang = (Math.PI * 2 * i) / n - Math.PI / 2;
+    pts.push(`${(cx + r * Math.cos(ang)).toFixed(1)},${(cy + r * Math.sin(ang)).toFixed(1)}`);
+  }
+  return svgWrap(`<polygon points="${pts.join(" ")}" fill="#e8eafc" stroke="#4a3f5e" stroke-width="3"/>`);
+}
+function svgRectangle(w, h) {
+  const scale = Math.min(150 / w, 90 / h, 18);
+  const pw = w * scale, ph = h * scale, x = (240 - pw) / 2, y = (170 - ph) / 2;
+  return svgWrap(
+    `<rect x="${x}" y="${y}" width="${pw}" height="${ph}" fill="#e8eafc" stroke="#4a3f5e" stroke-width="3"/>` +
+      `<text x="${x + pw / 2}" y="${y - 8}" text-anchor="middle" font-family="sans-serif" font-size="16" fill="#4a3f5e" font-weight="700">${w}</text>` +
+      `<text x="${x - 10}" y="${y + ph / 2 + 5}" text-anchor="end" font-family="sans-serif" font-size="16" fill="#4a3f5e" font-weight="700">${h}</text>`
+  );
+}
+function svgBarChart(data) {
+  const max = Math.max(...data.map((d) => d.value), 1);
+  const W = 240, H = 170, pad = 28, bw = (W - pad * 2) / data.length;
+  let bars = `<line x1="${pad}" y1="${H - pad}" x2="${W - 6}" y2="${H - pad}" stroke="#999" stroke-width="1.5"/>`;
+  bars += `<line x1="${pad}" y1="10" x2="${pad}" y2="${H - pad}" stroke="#999" stroke-width="1.5"/>`;
+  data.forEach((d, i) => {
+    const bh = ((H - pad - 14) * d.value) / max;
+    const x = pad + i * bw + bw * 0.18;
+    const y = H - pad - bh;
+    const w = bw * 0.64;
+    bars += `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${w.toFixed(1)}" height="${bh.toFixed(1)}" fill="#3b7de8" rx="3"/>`;
+    bars += `<text x="${(x + w / 2).toFixed(1)}" y="${H - pad + 14}" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#555">${d.label}</text>`;
+  });
+  return svgWrap(bars);
+}
+function svgLineChart(data) {
+  const max = Math.max(...data.map((d) => d.value), 1);
+  const W = 240, H = 170, pad = 28, step = (W - pad * 2) / (data.length - 1);
+  const pts = data.map((d, i) => {
+    const x = pad + i * step;
+    const y = H - pad - ((H - pad - 14) * d.value) / max;
+    return [x, y];
+  });
+  let svg = `<line x1="${pad}" y1="${H - pad}" x2="${W - 6}" y2="${H - pad}" stroke="#999" stroke-width="1.5"/>`;
+  svg += `<line x1="${pad}" y1="10" x2="${pad}" y2="${H - pad}" stroke="#999" stroke-width="1.5"/>`;
+  svg += `<polyline points="${pts.map((p) => `${p[0].toFixed(1)},${p[1].toFixed(1)}`).join(" ")}" fill="none" stroke="#2fa84f" stroke-width="2.5"/>`;
+  pts.forEach((p, i) => {
+    svg += `<circle cx="${p[0].toFixed(1)}" cy="${p[1].toFixed(1)}" r="4" fill="#2fa84f"/>`;
+    svg += `<text x="${p[0].toFixed(1)}" y="${H - pad + 14}" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#555">${data[i].label}</text>`;
+  });
+  return svgWrap(svg);
+}
+function svgCoordPoint(px, py) {
+  const W = 200, H = 200, pad = 24, span = 6, unit = (W - pad * 2) / span;
+  const ox = pad, oy = H - pad;
+  let svg = "";
+  // grid
+  for (let i = 0; i <= span; i++) {
+    svg += `<line x1="${ox + i * unit}" y1="${pad}" x2="${ox + i * unit}" y2="${oy}" stroke="#eee" stroke-width="1"/>`;
+    svg += `<line x1="${ox}" y1="${oy - i * unit}" x2="${W - pad}" y2="${oy - i * unit}" stroke="#eee" stroke-width="1"/>`;
+  }
+  // axes
+  svg += `<line x1="${ox}" y1="${oy}" x2="${W - 6}" y2="${oy}" stroke="#555" stroke-width="1.5"/>`;
+  svg += `<line x1="${ox}" y1="${oy}" x2="${ox}" y2="6" stroke="#555" stroke-width="1.5"/>`;
+  // axis numbers
+  for (let i = 1; i <= span; i++) {
+    svg += `<text x="${ox + i * unit}" y="${oy + 14}" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#777">${i}</text>`;
+    svg += `<text x="${ox - 8}" y="${oy - i * unit + 4}" text-anchor="end" font-family="sans-serif" font-size="10" fill="#777">${i}</text>`;
+  }
+  // point A
+  const ax = ox + px * unit, ay = oy - py * unit;
+  svg += `<circle cx="${ax}" cy="${ay}" r="5" fill="#e8743b"/>`;
+  svg += `<text x="${ax + 8}" y="${ay - 6}" font-family="sans-serif" font-size="13" font-weight="700" fill="#e8743b">A</text>`;
+  return svgWrap(svg, W, H);
+}
 
 function genMath(grade, category) {
   const g = Math.max(1, Math.min(12, grade));
@@ -481,6 +696,27 @@ function splitCategories(subjectKey, kid) {
   };
 }
 
+// How much of a stored day has been worked on. `answered` counts questions
+// with a non-empty response; `checked` counts ones that have been graded.
+// Used to avoid regenerating a day that's already in progress (saves API calls).
+function dayProgress(day) {
+  if (!day || typeof day !== "object") return { total: 0, answered: 0, checked: 0, fraction: 0 };
+  let total = 0, answered = 0, checked = 0;
+  for (const s of SUBJECTS) {
+    const list = Array.isArray(day[s.key]) ? day[s.key] : [];
+    for (const it of list) {
+      total++;
+      if (String(it.response || "").trim().length > 0) answered++;
+      if (it.checked) checked++;
+    }
+  }
+  return { total, answered, checked, fraction: total ? answered / total : 0 };
+}
+// A stored day is considered a real, usable set if it has questions.
+function dayHasQuestions(day) {
+  return dayProgress(day).total > 0;
+}
+
 // Build a full day of questions.
 //  • Math built-in categories  -> procedural (answers always exact)
 //  • Math custom categories    -> AI-generated (graded by exact match)
@@ -577,14 +813,7 @@ async function gradeWrittenBatch(subject, grade, items) {
     student_answer: it.response || "",
   }));
 
-  const res = await fetch("/api/grade", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ subject, grade, items: payload }),
-  });
-  if (!res.ok) throw new Error("grading request failed");
-
-  const data = await res.json();
+  const data = await apiRequest("grade", { subject, grade, items: payload });
   const parsed = data && Array.isArray(data.results) ? data.results : null;
   if (!parsed) throw new Error("bad grading shape");
 
@@ -598,7 +827,6 @@ async function gradeWrittenBatch(subject, grade, items) {
   });
 }
 
-/* ============================ DEFAULT CHORES ============================ */
 /* ============================ DEFAULT CHORES ============================ */
 const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const ALL_DAYS = [0, 1, 2, 3, 4, 5, 6];
@@ -685,6 +913,29 @@ const css = `
 @keyframes sq-bob { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-10px)} }
 .sq-bob { display:inline-block; animation: sq-bob 1.2s ease-in-out infinite; }
 
+/* ---- extra celebration motions (10 different pop-ups) ---- */
+@keyframes sq-spin { from{transform:rotate(0)} to{transform:rotate(360deg)} }
+@keyframes sq-spin-pop { 0%{transform:scale(0) rotate(-180deg);opacity:0} 60%{transform:scale(1.15) rotate(10deg)} 100%{transform:scale(1) rotate(0);opacity:1} }
+@keyframes sq-boing { 0%{transform:scale(0)} 40%{transform:scale(1.3)} 60%{transform:scale(.85)} 80%{transform:scale(1.08)} 100%{transform:scale(1)} }
+@keyframes sq-swing { 0%,100%{transform:rotate(-14deg)} 50%{transform:rotate(14deg)} }
+@keyframes sq-pulse { 0%,100%{transform:scale(1)} 50%{transform:scale(1.16)} }
+@keyframes sq-shake { 0%,100%{transform:translateX(0)} 20%{transform:translateX(-7px)} 40%{transform:translateX(7px)} 60%{transform:translateX(-5px)} 80%{transform:translateX(5px)} }
+@keyframes sq-floatup { 0%{transform:translateY(18px);opacity:0} 100%{transform:translateY(0);opacity:1} }
+@keyframes sq-rise {
+  0% { transform: translateY(112vh) rotate(0); opacity:1; }
+  100% { transform: translateY(-14vh) rotate(180deg); opacity:0; }
+}
+@keyframes sq-driftpop { 0%{transform:scale(0);opacity:0} 50%{transform:scale(1.2);opacity:1} 100%{transform:scale(.4) translateY(-40px);opacity:0} }
+.sq-anim-spin { display:inline-block; animation: sq-spin-pop .6s cubic-bezier(.2,1.3,.4,1) both, sq-spin 6s linear .6s infinite; }
+.sq-anim-boing { display:inline-block; animation: sq-boing .7s cubic-bezier(.2,1.4,.4,1) both; }
+.sq-anim-swing { display:inline-block; animation: sq-swing 1s ease-in-out infinite; transform-origin: 50% 0; }
+.sq-anim-pulse { display:inline-block; animation: sq-pulse 1s ease-in-out infinite; }
+.sq-anim-shake { display:inline-block; animation: sq-boing .6s cubic-bezier(.2,1.4,.4,1) both, sq-shake 1.2s ease .6s infinite; }
+/* rising-from-bottom confetti variant */
+.sq-risepiece { position: fixed; bottom: 0; font-size: 26px; animation: sq-rise linear forwards; pointer-events: none; z-index: 9998; }
+/* little stars that pop around the headline */
+.sq-spark { position:absolute; animation: sq-driftpop 1.4s ease-out infinite; pointer-events:none; }
+
 /* ---- app update banner ---- */
 @keyframes sq-slidedown { from{transform:translate(-50%,-120%);opacity:0} to{transform:translate(-50%,0);opacity:1} }
 .sq-update {
@@ -703,6 +954,14 @@ const css = `
   cursor: pointer; font-family: 'Fredoka', sans-serif;
 }
 .sq-update-btn:disabled { opacity: .6; cursor: wait; }
+
+/* ---- install (add to home screen) button ---- */
+.sq-install-btn {
+  padding: 10px 16px; border-radius: 12px; border: 1.5px solid #4a3f5e;
+  background: #4a3f5e; color: #fff; font-weight: 800; font-size: 14px;
+  cursor: pointer; font-family: 'Fredoka', sans-serif;
+}
+.sq-install-btn:hover { background: #5a4f70; }
 
 /* ---- teacher help ---- */
 .sq-help-btn {
@@ -728,10 +987,12 @@ export default function App() {
   const { updateReady, applyUpdate } = useAppUpdate();
 
   // auth / session
-  const [parent, setParent] = useState(null); // { username, isAdmin } when logged in
+  const [parent, setParent] = useState(null); // parent object when logged in
+  const [familyMode, setFamilyMode] = useState(false); // kid-mode via family link (no login)
   const [parentMode, setParentMode] = useState(false);
   const [adminInitialized, setAdminInitialized] = useState(true); // assume yes until checked
   const [setupProtected, setSetupProtected] = useState(false);
+  const [verifyState, setVerifyState] = useState(null); // {status:'working'|'error', message}
 
   // data
   const [kids, setKids] = useState([]);
@@ -745,48 +1006,124 @@ export default function App() {
   const [tab, setTab] = useState("study"); // study | chores | calendar
   const [calMode, setCalMode] = useState("study");
   const [showReward, setShowReward] = useState(false); // reward game modal
+  const [choreCeleb, setChoreCeleb] = useState(null); // celebration popup when all chores done
+  const choreCelebRef = useRef({}); // `${kid}:${date}` shown already this session
+  const lastAppCelebRef = useRef(-1); // vary the celebration shown
 
   const date = todayKey();
 
+  // log out the parent session. If a family (kid) link is active, fall back to
+  // kid mode instead of the login screen.
   const logout = useCallback(() => {
     api.logout();
     setParent(null);
+    setParentMode(false);
+    if (getFamilyToken()) {
+      setFamilyMode(true);
+    } else {
+      setKids([]);
+      setActiveKid(null);
+      setDay(null);
+      setChores([]);
+      setChoreLog({});
+    }
+  }, []);
+
+  // fully leave a family device link (rare; from kid mode)
+  const exitFamily = useCallback(() => {
+    api.exitFamily();
+    setFamilyMode(false);
     setKids([]);
     setActiveKid(null);
     setDay(null);
     setChores([]);
     setChoreLog({});
-    setParentMode(false);
   }, []);
 
-  /* ---------- initial load: validate existing session, then fetch kids ---------- */
+  const loadKidsInto = useCallback(async () => {
+    const ks = await api.listKids();
+    setKids(ks);
+    setActiveKid((cur) => (ks.some((k) => k.id === cur) ? cur : ks[0]?.id || null));
+    return ks;
+  }, []);
+
+  /* ---------- initial load: handle verify/family links, then session ---------- */
   useEffect(() => {
     (async () => {
-      if (!getToken()) {
-        // no session: find out whether the admin account exists yet (first run)
+      const params = new URLSearchParams(window.location.search);
+      const verifyTok = params.get("verify");
+      const familyCode = params.get("family");
+
+      // 1) Email verification link: ?verify=<token>
+      if (verifyTok) {
+        setVerifyState({ status: "working" });
         try {
-          const s = await api.adminStatus();
-          setAdminInitialized(!!s.initialized);
-          setSetupProtected(!!s.setupProtected);
-        } catch {
-          setAdminInitialized(true); // if the check fails, fall back to normal login
+          const p = await api.verifyEmail(verifyTok);
+          setParent(p);
+          await loadKidsInto();
+          cleanUrl();
+          setVerifyState(null);
+        } catch (e) {
+          setVerifyState({ status: "error", message: e.message || "This link is invalid or expired." });
+        } finally {
+          setLoading(false);
         }
-        setLoading(false);
         return;
       }
-      try {
-        const me = await api.me();
-        setParent(me);
-        const ks = await api.listKids();
-        setKids(ks);
-        if (ks.length) setActiveKid(ks[0].id);
-      } catch {
-        api.logout();
-      } finally {
-        setLoading(false);
+
+      // 2) Kids' no-login family link: ?family=<code>
+      if (familyCode) {
+        try {
+          await api.familyAccess(familyCode.trim().toUpperCase());
+          setFamilyMode(true);
+          await loadKidsInto();
+        } catch (e) {
+          // bad/expired link: fall through to normal screens
+          setVerifyState({ status: "error", message: e.message || "That family link is no longer valid." });
+        } finally {
+          cleanUrl();
+          setLoading(false);
+        }
+        return;
       }
+
+      // 3) Existing parent session
+      if (getToken()) {
+        try {
+          const me = await api.me();
+          setParent(me);
+          await loadKidsInto();
+        } catch {
+          api.logout();
+        } finally {
+          setLoading(false);
+        }
+        return;
+      }
+
+      // 4) Existing family (kid-mode) token on this device
+      if (getFamilyToken()) {
+        try {
+          await loadKidsInto();
+          setFamilyMode(true);
+          setLoading(false);
+          return;
+        } catch {
+          api.exitFamily();
+        }
+      }
+
+      // 5) Nothing yet: check first-run admin status, then show login/signup
+      try {
+        const s = await api.adminStatus();
+        setAdminInitialized(!!s.initialized);
+        setSetupProtected(!!s.setupProtected);
+      } catch {
+        setAdminInitialized(true);
+      }
+      setLoading(false);
     })();
-  }, []);
+  }, [loadKidsInto]);
 
   // if any request reports the session is invalid, sign out
   useEffect(() => {
@@ -795,20 +1132,18 @@ export default function App() {
     return () => window.removeEventListener("sq-unauthorized", onUnauth);
   }, [logout]);
 
-  // called by the login/signup screen once a token is set
+  // called by the login screen once a parent token is set
   const handleAuthed = async (parentObj) => {
     setParent(parentObj);
+    setFamilyMode(false);
     setLoading(true);
     try {
-      const ks = await api.listKids();
-      setKids(ks);
-      setActiveKid(ks[0]?.id || null);
+      await loadKidsInto();
     } finally {
       setLoading(false);
     }
   };
 
-  // refresh kids after parent edits (used by the parent panel)
   // refresh kids after parent edits. Pass a known array (e.g. the one a
   // create/update/delete call already returned) to update instantly without a
   // second fetch that could momentarily return stale data.
@@ -826,10 +1161,14 @@ export default function App() {
       const kid = kids.find((x) => x.id === kidId);
       if (!kid) return;
 
-      // daily questions — generate once per day if missing
+      // daily questions — generate once per day, and never regenerate over a
+      // set that's already in progress. If a stored day exists with questions,
+      // we always keep it (this also enforces "don't generate new questions if
+      // the current ones are <50% answered" — they're kept, not replaced).
       const dayKeyName = `daily:${kidId}:${date}`;
       let d = await store.get(dayKeyName);
-      if (!d) {
+      if (!dayHasQuestions(d)) {
+        // No usable set yet for today -> build one (the only time we call the API).
         setDay(null);
         setDayLoading(true);
         try {
@@ -879,7 +1218,15 @@ export default function App() {
     !!day &&
     SUBJECTS.every((s) => Array.isArray(day[s.key]) && day[s.key].length > 0 && day[s.key].every((it) => it.correct === true));
 
+  // "Done with questions" = every question has been answered AND checked at
+  // least once (regardless of right/wrong). This is the trigger for the
+  // questions+answers email.
+  const allQuestionsChecked =
+    !!day &&
+    SUBJECTS.every((s) => Array.isArray(day[s.key]) && day[s.key].length > 0 && day[s.key].every((it) => it.checked === true));
+
   const choresToday = chores.filter(choreAppliesToday);
+  const choresExistToday = choresToday.length > 0;
   const allChoresDone = choresToday.length === 0 || choresToday.every((c) => (choreLog[c.id] || {}).completed === "yes");
 
   const rewardEarned = allQuestionsCorrect && allChoresDone;
@@ -893,6 +1240,56 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [rewardEarned]);
 
+  /* ---------- completion emails to parents ----------
+     When the child finishes questions / chores, ask the server to email the
+     parents. The server validates the condition and dedupes per kid/day, so
+     it's safe to call more than once. We avoid re-calling within a session
+     unless the previous attempt wasn't actually sent (e.g. brief write lag). */
+  const notifiedRef = useRef({});
+  const maybeNotify = useCallback(
+    async (type, attempt = 0) => {
+      if (!activeKid) return;
+      const key = `${activeKid}:${date}:${type}`;
+      if (notifiedRef.current[key] === "done" || notifiedRef.current[key] === "pending") return;
+      notifiedRef.current[key] = "pending";
+      try {
+        const r = await api.notify(type, activeKid, date);
+        if (r && (r.alreadySent || r.sent > 0 || r.emailConfigured === false || r.noRecipients)) {
+          notifiedRef.current[key] = "done";
+        } else if (r && r.notReady && attempt < 3) {
+          // data may not have propagated yet — retry shortly
+          notifiedRef.current[key] = null;
+          setTimeout(() => maybeNotify(type, attempt + 1), 1500);
+        } else {
+          notifiedRef.current[key] = null; // allow a later retry on state change
+        }
+      } catch {
+        notifiedRef.current[key] = null;
+      }
+    },
+    [activeKid, date]
+  );
+
+  useEffect(() => {
+    if (allQuestionsChecked) maybeNotify("questions");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [allQuestionsChecked, activeKid]);
+
+  useEffect(() => {
+    if (choresExistToday && allChoresDone) {
+      maybeNotify("chores");
+      // celebrate once per kid/day (this session)
+      const k = `${activeKid}:${date}`;
+      if (activeKid && !choreCelebRef.current[k]) {
+        choreCelebRef.current[k] = true;
+        const idx = pickCelebration(lastAppCelebRef.current);
+        lastAppCelebRef.current = idx;
+        setChoreCeleb({ index: idx, headline: "All your chores are done! 🧹✨" });
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [allChoresDone, choresExistToday, activeKid]);
+
   if (loading)
     return (
       <div style={{ ...wrap, display: "grid", placeItems: "center", minHeight: "100vh" }}>
@@ -904,13 +1301,29 @@ export default function App() {
       </div>
     );
 
-  // not logged in -> show the account screen
-  // not logged in -> first-run admin setup, or the normal account screen
-  if (!parent) {
-    const banner = updateReady ? <UpdateBanner onUpdate={applyUpdate} /> : null;
+  // Email-verification landing (?verify=...) — show while working or on error.
+  if (verifyState) {
+    return <VerifyScreen state={verifyState} onContinue={() => setVerifyState(null)} />;
+  }
+
+  const banner = updateReady ? <UpdateBanner onUpdate={applyUpdate} /> : null;
+
+  // Signed out AND no kid-mode link active -> first-run admin setup or login/signup.
+  if (!parent && !familyMode) {
     if (!adminInitialized)
       return <AdminInitScreen setupProtected={setupProtected} onAuthed={handleAuthed} updateBanner={banner} />;
     return <AuthScreen onAuthed={handleAuthed} updateBanner={banner} />;
+  }
+
+  // In kid mode, opening the parent area requires a real parent login first.
+  if (familyMode && !parent && parentMode) {
+    return (
+      <ParentLoginScreen
+        onAuthed={handleAuthed}
+        onCancel={() => setParentMode(false)}
+        updateBanner={banner}
+      />
+    );
   }
 
   const kid = kids.find((x) => x.id === activeKid) || null;
@@ -922,6 +1335,7 @@ export default function App() {
 
       <Header
         parent={parent}
+        familyMode={familyMode}
         kids={kids}
         activeKid={activeKid}
         setActiveKid={setActiveKid}
@@ -931,7 +1345,7 @@ export default function App() {
         onLogout={logout}
       />
 
-      {parentMode ? (
+      {parentMode && parent ? (
         <ParentPanel
           parent={parent}
           setParent={setParent}
@@ -942,7 +1356,7 @@ export default function App() {
           date={date}
         />
       ) : !kid ? (
-        <EmptyState onParent={() => setParentMode(true)} />
+        <EmptyState onParent={() => setParentMode(true)} familyMode={familyMode} />
       ) : (
         <>
           <TabBar tab={tab} setTab={setTab} />
@@ -970,6 +1384,14 @@ export default function App() {
         <RewardGameModal grade={kid.grade} kidName={kid.name} onClose={() => setShowReward(false)} />
       )}
 
+      {choreCeleb && !showReward && (
+        <CelebrationOverlay
+          index={choreCeleb.index}
+          headline={choreCeleb.headline}
+          onClose={() => setChoreCeleb(null)}
+        />
+      )}
+
       <footer className="sq-noprint" style={{ textAlign: "center", padding: "24px 0", color: "#a99fb8", fontSize: 13 }}>
         StudyQuest · a new set of questions appears each day
       </footer>
@@ -980,32 +1402,95 @@ export default function App() {
 /* ============================ AUTH SCREEN ============================ */
 function AuthScreen({ onAuthed, updateBanner }) {
   const [mode, setMode] = useState("login"); // login | signup
-  const [username, setUsername] = useState("");
+  const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
   const [joinFamily, setJoinFamily] = useState(false);
   const [familyCode, setFamilyCode] = useState("");
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
+  const [pending, setPending] = useState(null); // {email, devLink?, emailConfigured} after signup
+  const [needsVerify, setNeedsVerify] = useState(false); // login blocked: unverified
+  const [resendMsg, setResendMsg] = useState("");
+
+  const isEmailish = (v) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v.trim());
 
   const submit = async () => {
     setErr("");
-    if (username.trim().length < 3) return setErr("Username must be at least 3 characters.");
+    setNeedsVerify(false);
+    if (!isEmailish(email)) return setErr("Enter a valid email address.");
     if (password.length < 6) return setErr("Password must be at least 6 characters.");
     if (mode === "signup" && password !== confirm) return setErr("Passwords don't match.");
     if (mode === "signup" && joinFamily && !familyCode.trim()) return setErr("Enter the family code, or uncheck the box to start a new family.");
     setBusy(true);
     try {
-      const parentObj =
-        mode === "signup"
-          ? await api.signup(username.trim(), password, joinFamily ? familyCode.trim() : "")
-          : await api.login(username.trim(), password);
-      await onAuthed(parentObj);
+      if (mode === "signup") {
+        const r = await api.signup(email.trim(), password, joinFamily ? familyCode.trim() : "");
+        setPending({ email: email.trim(), devLink: r.devLink, emailConfigured: r.emailConfigured !== false });
+        setBusy(false);
+      } else {
+        const parentObj = await api.login(email.trim(), password);
+        await onAuthed(parentObj);
+      }
     } catch (e) {
-      setErr(e.message || "Something went wrong.");
+      if (e.data && e.data.unverified) {
+        setNeedsVerify(true);
+        setErr("Please verify your email first — check your inbox for the link.");
+      } else {
+        setErr(e.message || "Something went wrong.");
+      }
       setBusy(false);
     }
   };
+
+  const resend = async () => {
+    setResendMsg("");
+    try {
+      await api.resendVerification(email.trim());
+      setResendMsg("If that email is registered, we've sent a new verification link.");
+    } catch {
+      setResendMsg("Could not resend right now. Try again shortly.");
+    }
+  };
+
+  // After signup: ask them to check their email.
+  if (pending) {
+    return (
+      <div className="sq-root" style={{ ...wrap, minHeight: "100vh", display: "grid", placeItems: "center" }}>
+        <style>{css}</style>
+        {updateBanner}
+        <div className="sq-card" style={{ ...panel, maxWidth: 460, width: "100%", textAlign: "center" }}>
+          <div style={{ fontSize: 44 }}>📧</div>
+          <h1 className="sq-h" style={{ ...h1, marginTop: 4 }}>Check your email</h1>
+          <p style={{ color: "#7a6f8c" }}>
+            We sent a verification link to <strong>{pending.email}</strong>. Click it to activate your account, and
+            you'll be taken straight into your family.
+          </p>
+          {!pending.emailConfigured && (
+            <div style={{ ...errBox, background: "#fff6e6", color: "#b8702a", textAlign: "left" }}>
+              Email sending isn't configured on this deployment yet, so the message won't arrive. See the README
+              (RESEND_API_KEY / FROM_EMAIL) to enable it.
+            </div>
+          )}
+          {pending.devLink && (
+            <div style={{ ...errBox, background: "#eef4fb", color: "#3b5b8e", textAlign: "left", wordBreak: "break-all" }}>
+              <strong>Dev mode:</strong> <a href={pending.devLink} style={{ color: "#3b5b8e" }}>{pending.devLink}</a>
+            </div>
+          )}
+          <button style={btnGhost} onClick={resend}>Resend the email</button>
+          {resendMsg && <div style={{ color: "#2fa84f", fontWeight: 700, marginTop: 10, fontSize: 14 }}>{resendMsg}</div>}
+          <div style={{ marginTop: 16 }}>
+            <button
+              onClick={() => { setPending(null); setMode("login"); }}
+              style={{ background: "none", border: "none", color: "#4a3f5e", fontWeight: 800, cursor: "pointer", fontFamily: FONT_DISPLAY, fontSize: 14 }}
+            >
+              Back to log in
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="sq-root" style={{ ...wrap, minHeight: "100vh", display: "grid", placeItems: "center" }}>
@@ -1018,18 +1503,20 @@ function AuthScreen({ onAuthed, updateBanner }) {
         </h1>
         <p style={{ color: "#7a6f8c", textAlign: "center", marginTop: -6 }}>
           {mode === "signup"
-            ? "Your kids' profiles and progress are saved to your account."
+            ? "Sign up with your email — we'll send a quick verification link."
             : "Log in to see your kids and their progress."}
         </p>
 
-        <label style={lbl}>Username</label>
+        <label style={lbl}>Email address</label>
         <input
           style={input}
-          value={username}
-          onChange={(e) => setUsername(e.target.value)}
-          placeholder="e.g. smith_family"
+          type="email"
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+          placeholder="you@example.com"
           autoCapitalize="none"
           autoCorrect="off"
+          onKeyDown={(e) => mode === "login" && e.key === "Enter" && submit()}
         />
         <label style={lbl}>Password</label>
         <input
@@ -1075,6 +1562,12 @@ function AuthScreen({ onAuthed, updateBanner }) {
         )}
 
         {err && <div style={errBox}>{err}</div>}
+        {needsVerify && (
+          <div style={{ textAlign: "center", marginTop: 8 }}>
+            <button style={btnGhost} onClick={resend}>Resend verification email</button>
+            {resendMsg && <div style={{ color: "#2fa84f", fontWeight: 700, marginTop: 8, fontSize: 14 }}>{resendMsg}</div>}
+          </div>
+        )}
 
         <button style={{ ...btnPrimary, opacity: busy ? 0.6 : 1 }} disabled={busy} onClick={submit}>
           {busy ? "Please wait…" : mode === "signup" ? "Create account" : "Log in"}
@@ -1086,10 +1579,83 @@ function AuthScreen({ onAuthed, updateBanner }) {
             onClick={() => {
               setMode(mode === "signup" ? "login" : "signup");
               setErr("");
+              setNeedsVerify(false);
             }}
             style={{ background: "none", border: "none", color: "#4a3f5e", fontWeight: 800, cursor: "pointer", fontFamily: FONT_DISPLAY, fontSize: 14 }}
           >
             {mode === "signup" ? "Log in" : "Create one"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ===================== EMAIL VERIFICATION LANDING ===================== */
+function VerifyScreen({ state, onContinue }) {
+  return (
+    <div className="sq-root" style={{ ...wrap, minHeight: "100vh", display: "grid", placeItems: "center" }}>
+      <style>{css}</style>
+      <div className="sq-card" style={{ ...panel, maxWidth: 440, width: "100%", textAlign: "center" }}>
+        {state.status === "working" ? (
+          <>
+            <div style={{ fontSize: 44 }} className="sq-bob">✨</div>
+            <h1 className="sq-h" style={{ ...h1, marginTop: 4 }}>Verifying your email…</h1>
+            <p style={{ color: "#7a6f8c" }}>One moment while we activate your account.</p>
+          </>
+        ) : (
+          <>
+            <div style={{ fontSize: 44 }}>⚠️</div>
+            <h1 className="sq-h" style={{ ...h1, marginTop: 4 }}>Verification problem</h1>
+            <p style={{ color: "#7a6f8c" }}>{state.message}</p>
+            <button style={btnPrimary} onClick={onContinue}>Back to log in</button>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ============ PARENT LOGIN (entering parent area from kid mode) ============ */
+function ParentLoginScreen({ onAuthed, onCancel, updateBanner }) {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const submit = async () => {
+    setErr("");
+    setBusy(true);
+    try {
+      const p = await api.login(email.trim(), password);
+      await onAuthed(p);
+    } catch (e) {
+      setErr(e.message || "Incorrect email or password.");
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="sq-root" style={{ ...wrap, minHeight: "100vh", display: "grid", placeItems: "center" }}>
+      <style>{css}</style>
+      {updateBanner}
+      <div className="sq-card" style={{ ...panel, maxWidth: 420, width: "100%" }}>
+        <div style={{ fontSize: 38, textAlign: "center" }}>🔐</div>
+        <h1 className="sq-h" style={{ ...h1, textAlign: "center", marginTop: 4 }}>Parent log in</h1>
+        <p style={{ color: "#7a6f8c", textAlign: "center", marginTop: -6 }}>
+          Log in to manage kids, chores, and settings.
+        </p>
+        <label style={lbl}>Email address</label>
+        <input style={input} type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com" autoCapitalize="none" autoCorrect="off" />
+        <label style={lbl}>Password</label>
+        <input style={input} type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Your password" onKeyDown={(e) => e.key === "Enter" && submit()} />
+        {err && <div style={errBox}>{err}</div>}
+        <button style={{ ...btnPrimary, opacity: busy ? 0.6 : 1 }} disabled={busy} onClick={submit}>
+          {busy ? "Please wait…" : "Log in"}
+        </button>
+        <div style={{ textAlign: "center", marginTop: 12 }}>
+          <button onClick={onCancel} style={{ background: "none", border: "none", color: "#7a6f8c", fontWeight: 700, cursor: "pointer", fontFamily: FONT_DISPLAY, fontSize: 14 }}>
+            ← Back to kid mode
           </button>
         </div>
       </div>
@@ -1155,7 +1721,8 @@ function AdminInitScreen({ setupProtected, onAuthed, updateBanner }) {
 }
 
 /* =============================== HEADER ============================== */
-function Header({ parent, kids, activeKid, setActiveKid, parentMode, onParent, onExitParent, onLogout }) {
+function Header({ parent, familyMode, kids, activeKid, setActiveKid, parentMode, onParent, onExitParent, onLogout }) {
+  const displayName = parent ? (parent.isAdmin ? "admin" : parent.email) : null;
   return (
     <header className="sq-noprint" style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", marginBottom: 18 }}>
       <div className="sq-h" style={{ fontSize: 26, fontWeight: 700, color: "#4a3f5e", display: "flex", alignItems: "center", gap: 8 }}>
@@ -1180,19 +1747,25 @@ function Header({ parent, kids, activeKid, setActiveKid, parentMode, onParent, o
           ))}
         </div>
       )}
-      {parent && (
-        <span className="sq-h" style={{ color: "#9a8fb0", fontSize: 13, fontWeight: 700 }}>
-          @{parent.username}{parent.isAdmin ? " 🛡️" : ""}
+      {displayName && (
+        <span className="sq-h" style={{ color: "#9a8fb0", fontSize: 13, fontWeight: 700, maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          {displayName}{parent.isAdmin ? " 🛡️" : ""}
         </span>
       )}
-      {parentMode ? (
+      <InstallButton />
+      {/* kid-mode (family link, no parent logged in): only offer Parent log in */}
+      {familyMode && !parent ? (
+        <button style={btnGhost} onClick={onParent}>🔒 Parent</button>
+      ) : parentMode ? (
         <button style={btnGhost} onClick={onExitParent}>← Exit parent</button>
       ) : (
-        <button style={btnGhost} onClick={onParent}>🔒 Parent</button>
+        <>
+          <button style={btnGhost} onClick={onParent}>🔒 Parent</button>
+          <button style={{ ...btnGhost, borderColor: "#e0506b", color: "#e0506b" }} onClick={onLogout}>
+            {familyMode ? "Switch account" : "Log out"}
+          </button>
+        </>
       )}
-      <button style={{ ...btnGhost, borderColor: "#e0506b", color: "#e0506b" }} onClick={onLogout}>
-        Log out
-      </button>
     </header>
   );
 }
@@ -1223,13 +1796,22 @@ function TabBar({ tab, setTab }) {
   );
 }
 
-function EmptyState({ onParent }) {
+function EmptyState({ onParent, familyMode }) {
   return (
     <div className="sq-card" style={{ ...panel, textAlign: "center" }}>
       <div style={{ fontSize: 40 }}>👋</div>
       <h2 className="sq-h" style={h2}>No kid profiles yet</h2>
-      <p style={{ color: "#7a6f8c" }}>Open the parent panel to add a child and set their grade level.</p>
-      <button style={btnPrimary} onClick={onParent}>🔒 Open parent panel</button>
+      {familyMode ? (
+        <>
+          <p style={{ color: "#7a6f8c" }}>Ask a parent to log in and add a child with their grade level.</p>
+          <button style={btnPrimary} onClick={onParent}>🔒 Parent log in</button>
+        </>
+      ) : (
+        <>
+          <p style={{ color: "#7a6f8c" }}>Open the parent panel to add a child and set their grade level.</p>
+          <button style={btnPrimary} onClick={onParent}>🔒 Open parent panel</button>
+        </>
+      )}
     </div>
   );
 }
@@ -1279,35 +1861,98 @@ function CorrectBadge({ seed = 0 }) {
   );
 }
 
-function AcedOverlay({ subject, color, onClose }) {
-  // celebratory raining emojis + a trophy card when a subject is 100%
-  const rain = Array.from({ length: 26 }).map((_, i) => ({
-    key: i,
-    char: PARTICLES[i % PARTICLES.length],
-    left: `${Math.random() * 100}%`,
-    dur: `${1.8 + Math.random() * 1.6}s`,
-    delay: `${Math.random() * 0.7}s`,
-    size: `${20 + Math.random() * 18}px`,
-  }));
+/* ---- 10 different celebratory pop-ups ----
+   Each has its own emoji, words, color, emoji-motion and falling-particle
+   style, so kids see fun variety when they ace a subject or finish chores.   */
+const CELEBRATIONS = [
+  { emoji: "🏆", title: "Perfect Score!", motion: "bob", fx: "rain", color: "#e8a020", particles: ["⭐", "🏆", "✨", "🌟"] },
+  { emoji: "🎉", title: "Woohoo!", motion: "boing", fx: "burst", color: "#e0506b", particles: ["🎉", "🎊", "💥", "✨"] },
+  { emoji: "🚀", title: "Blast Off!", motion: "shake", fx: "rise", color: "#3b7de8", particles: ["🚀", "⭐", "💫", "✨"] },
+  { emoji: "🌟", title: "Superstar!", motion: "spin", fx: "rain", color: "#d4a017", particles: ["🌟", "⭐", "✨", "💫"] },
+  { emoji: "🦄", title: "Magical!", motion: "swing", fx: "burst", color: "#9b4dca", particles: ["🦄", "🌈", "✨", "💖"] },
+  { emoji: "🎯", title: "Bullseye!", motion: "boing", fx: "burst", color: "#2fa84f", particles: ["🎯", "🎉", "👏", "⭐"] },
+  { emoji: "👏", title: "Way to Go!", motion: "pulse", fx: "rise", color: "#e8743b", particles: ["👏", "🙌", "✨", "🎉"] },
+  { emoji: "🥳", title: "Amazing Job!", motion: "boing", fx: "rain", color: "#e0506b", particles: ["🥳", "🎊", "🎉", "⭐"] },
+  { emoji: "🧠", title: "Big Brain!", motion: "pulse", fx: "burst", color: "#3b7de8", particles: ["🧠", "💡", "⭐", "✨"] },
+  { emoji: "🔥", title: "On Fire!", motion: "shake", fx: "rise", color: "#e8743b", particles: ["🔥", "💪", "⭐", "✨"] },
+];
+
+const CHEERS = [
+  "You're a superstar — keep it up!",
+  "Incredible work today!",
+  "You worked so hard — be proud!",
+  "Your brain is getting stronger!",
+  "High five! That was awesome.",
+  "You did it — fantastic job!",
+];
+
+// Pick a celebration, optionally avoiding the last one shown for variety.
+function pickCelebration(avoidIndex) {
+  let i = Math.floor(Math.random() * CELEBRATIONS.length);
+  if (CELEBRATIONS.length > 1 && i === avoidIndex) i = (i + 1) % CELEBRATIONS.length;
+  return i;
+}
+
+const motionClass = {
+  bob: "sq-bob",
+  boing: "sq-anim-boing",
+  spin: "sq-anim-spin",
+  swing: "sq-anim-swing",
+  pulse: "sq-anim-pulse",
+  shake: "sq-anim-shake",
+};
+
+function CelebrationOverlay({ index = 0, headline, message, onClose }) {
+  const c = CELEBRATIONS[index % CELEBRATIONS.length];
+  const cheer = message || CHEERS[index % CHEERS.length];
+
+  // Falling ("rain") or rising particles across the screen.
+  const showRainOrRise = c.fx === "rain" || c.fx === "rise";
+  const pieces = showRainOrRise
+    ? Array.from({ length: 26 }).map((_, i) => ({
+        key: i,
+        char: c.particles[i % c.particles.length],
+        left: `${Math.random() * 100}%`,
+        dur: `${1.8 + Math.random() * 1.6}s`,
+        delay: `${Math.random() * 0.7}s`,
+        size: `${20 + Math.random() * 18}px`,
+      }))
+    : [];
+
   return (
     <div className="sq-overlay" onClick={onClose}>
-      {rain.map((r) => (
-        <span
-          key={r.key}
-          className="sq-rainpiece"
-          style={{ left: r.left, animationDuration: r.dur, animationDelay: r.delay, fontSize: r.size }}
-        >
-          {r.char}
-        </span>
-      ))}
-      <div className="sq-overlay-card" onClick={(e) => e.stopPropagation()}>
-        <div style={{ fontSize: 70 }} className="sq-bob">🏆</div>
-        <h2 className="sq-h" style={{ fontSize: 30, color: color, margin: "6px 0 4px" }}>Perfect Score!</h2>
-        <p style={{ fontSize: 18, fontWeight: 700, color: "#4a3f5e", margin: "0 0 6px" }}>
-          You got every {subject} question right! 🎉
-        </p>
-        <p style={{ color: "#7a6f8c", margin: "0 0 18px" }}>You're a superstar. Keep it up!</p>
-        <button style={{ ...btnPrimary, background: color, marginTop: 0 }} onClick={onClose}>
+      {showRainOrRise &&
+        pieces.map((r) => (
+          <span
+            key={r.key}
+            className={c.fx === "rise" ? "sq-risepiece" : "sq-rainpiece"}
+            style={{ left: r.left, animationDuration: r.dur, animationDelay: r.delay, fontSize: r.size }}
+          >
+            {r.char}
+          </span>
+        ))}
+      <div className="sq-overlay-card" style={{ position: "relative" }} onClick={(e) => e.stopPropagation()}>
+        {/* burst variant: little sparks pop around the card */}
+        {c.fx === "burst" &&
+          Array.from({ length: 8 }).map((_, i) => (
+            <span
+              key={i}
+              className="sq-spark"
+              style={{
+                left: `${10 + Math.random() * 80}%`,
+                top: `${8 + Math.random() * 70}%`,
+                fontSize: `${16 + Math.random() * 14}px`,
+                animationDelay: `${Math.random() * 1.2}s`,
+              }}
+            >
+              {c.particles[i % c.particles.length]}
+            </span>
+          ))}
+        <div style={{ fontSize: 70 }} className={motionClass[c.motion] || "sq-bob"}>{c.emoji}</div>
+        <h2 className="sq-h" style={{ fontSize: 30, color: c.color, margin: "6px 0 4px" }}>{c.title}</h2>
+        <p style={{ fontSize: 18, fontWeight: 700, color: "#4a3f5e", margin: "0 0 6px" }}>{headline}</p>
+        <p style={{ color: "#7a6f8c", margin: "0 0 18px" }}>{cheer}</p>
+        <button style={{ ...btnPrimary, background: c.color, marginTop: 0 }} onClick={onClose}>
           Yay! Continue ✨
         </button>
       </div>
@@ -1552,9 +2197,10 @@ function StudyView({ kid, day, saveDay, dayLoading }) {
   const [grading, setGrading] = useState(null); // subject currently being graded
   const [banner, setBanner] = useState(null); // {subject, type, text}
   const [now, setNow] = useState(Date.now()); // live clock for countdowns
-  const [aced, setAced] = useState(null); // {subject,color} -> show overlay
+  const [aced, setAced] = useState(null); // celebration popup payload {index, headline}
   const [celebrate, setCelebrate] = useState({}); // `${subject}:${i}` -> true (newly correct)
   const [helpLoading, setHelpLoading] = useState({}); // `${subject}:${i}` -> true while fetching help
+  const lastCelebRef = useRef(-1); // last celebration shown, so we vary them
 
   // tick every second so lock countdowns update and inputs re-enable
   useEffect(() => {
@@ -1616,7 +2262,9 @@ function StudyView({ kid, day, saveDay, dayLoading }) {
       }, 1200);
     }
     if (graded.every((g) => g.correct === true)) {
-      setAced({ subject, color });
+      const idx = pickCelebration(lastCelebRef.current);
+      lastCelebRef.current = idx;
+      setAced({ index: idx, headline: `You got every ${subject} question right! 🎉` });
     }
   };
 
@@ -1649,9 +2297,25 @@ function StudyView({ kid, day, saveDay, dayLoading }) {
     }
   };
 
+  const subjectComplete = (subject) =>
+    (day[subject] || []).length > 0 && day[subject].every((it) => String(it.response || "").trim().length > 0);
+
   const checkSubject = async (subject) => {
     const list = day[subject];
     const color = subjMeta(subject).color;
+
+    // Require every question to be answered before checking. This avoids
+    // wasted grading calls on partially-filled subjects (and nudges kids to
+    // attempt everything first).
+    if (!subjectComplete(subject)) {
+      const blanks = list.filter((it) => !String(it.response || "").trim()).length;
+      setBanner({
+        subject,
+        type: "warn",
+        text: `Answer all ${list.length} questions first — ${blanks} still blank.`,
+      });
+      return;
+    }
 
     // Math: always graded locally — exact, instant, no internet needed.
     if (subject === "Math") {
@@ -1676,6 +2340,16 @@ function StudyView({ kid, day, saveDay, dayLoading }) {
       await applyGrades(subject, core, color);
       setBanner({ subject, type: "ok", text: "✨ Graded by AI — synonyms and close answers count." });
     } catch (e) {
+      // If we were rate-limited, tell the child to slow down — don't burn the
+      // attempt by grading offline.
+      if (e && (e.status === 429 || (e.data && e.data.rateLimited))) {
+        setBanner({
+          subject,
+          type: "warn",
+          text: (e.data && e.data.error) || "You're checking too fast — wait a moment and try again.",
+        });
+        return;
+      }
       // graceful offline fallback
       const core = list.map((it) => ({
         ...it,
@@ -1752,15 +2426,29 @@ function StudyView({ kid, day, saveDay, dayLoading }) {
           <div className="sq-card" style={{ ...panel, borderTop: `5px solid ${s.color}` }}>
             <div className="sq-noprint" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
               <h3 className="sq-h" style={{ margin: 0, fontSize: 22, color: s.color }}>{s.key}</h3>
-              <div style={{ display: "flex", gap: 8 }}>
-                <button style={{ ...btnGhost, borderColor: s.color, color: s.color }} onClick={() => printSubject(s.key)}>🖨️ Print this subject</button>
-                <button
-                  style={{ ...btnPrimary, background: s.color, opacity: grading === s.key ? 0.6 : 1, cursor: grading === s.key ? "wait" : "pointer" }}
-                  disabled={grading === s.key}
-                  onClick={() => checkSubject(s.key)}
-                >
-                  {grading === s.key ? "⏳ Checking…" : "✓ Check my answers"}
-                </button>
+              <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                {(() => {
+                  const answered = list.filter((it) => String(it.response || "").trim()).length;
+                  const ready = answered === list.length;
+                  return (
+                    <>
+                      {!ready && (
+                        <span className="sq-noprint" style={{ fontSize: 13, color: "#9a8fb0", fontWeight: 700 }}>
+                          {answered}/{list.length} answered
+                        </span>
+                      )}
+                      <button style={{ ...btnGhost, borderColor: s.color, color: s.color }} onClick={() => printSubject(s.key)}>🖨️ Print this subject</button>
+                      <button
+                        style={{ ...btnPrimary, background: s.color, opacity: grading === s.key || !ready ? 0.5 : 1, cursor: grading === s.key ? "wait" : !ready ? "not-allowed" : "pointer" }}
+                        disabled={grading === s.key || !ready}
+                        title={ready ? "" : "Answer every question first"}
+                        onClick={() => checkSubject(s.key)}
+                      >
+                        {grading === s.key ? "⏳ Checking…" : "✓ Check my answers"}
+                      </button>
+                    </>
+                  );
+                })()}
               </div>
             </div>
 
@@ -1799,6 +2487,12 @@ function StudyView({ kid, day, saveDay, dayLoading }) {
                       </div>
                     )}
                     <div style={{ fontWeight: 700, fontSize: 16, marginBottom: 6 }}>{it.q}</div>
+                    {it.svg && (
+                      <div
+                        style={{ margin: "4px 0 10px", maxWidth: 260 }}
+                        dangerouslySetInnerHTML={{ __html: it.svg }}
+                      />
+                    )}
                     <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
                       <input
                         style={{
@@ -1871,7 +2565,7 @@ function StudyView({ kid, day, saveDay, dayLoading }) {
         );
       })()}
 
-      {aced && <AcedOverlay subject={aced.subject} color={aced.color} onClose={() => setAced(null)} />}
+      {aced && <CelebrationOverlay index={aced.index} headline={aced.headline} onClose={() => setAced(null)} />}
     </div>
   );
 }
@@ -1891,7 +2585,7 @@ function openPrintWindow(kid, onlySubject, day) {
       const items = day[subj]
         .map(
           (it, i) =>
-            `<li><div class="q">${i + 1}. ${esc(it.q)}</div><div class="ans"></div></li>`
+            `<li><div class="q">${i + 1}. ${esc(it.q)}</div>${it.svg ? `<div class="fig">${it.svg}</div>` : ""}<div class="ans"></div></li>`
         )
         .join("");
       return `<section class="page">
@@ -1914,6 +2608,8 @@ function openPrintWindow(kid, onlySubject, day) {
     ol{font-size:17px;line-height:1.4}
     li{margin-bottom:26px}
     .q{font-weight:700}
+    .fig{margin:8px 0;max-width:240px}
+    .fig svg{max-width:240px;height:auto}
     .ans{border-bottom:1.5px solid #bbb;height:34px;margin-top:10px}
     @media print{.page{min-height:auto}}
   </style></head><body>${pages}
@@ -2208,7 +2904,7 @@ function FamilyManager() {
   const [info, setInfo] = useState(null); // { code, members }
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
-  const [copied, setCopied] = useState(false);
+  const [copied, setCopied] = useState("");
 
   const load = async () => {
     setErr("");
@@ -2223,19 +2919,21 @@ function FamilyManager() {
     load();
   }, []);
 
-  const copy = async () => {
-    if (!info || !info.code) return;
+  const kidsLink = info && info.code ? `${window.location.origin}/?family=${info.code}` : "";
+
+  const copy = async (text, which) => {
+    if (!text) return;
     try {
-      await navigator.clipboard.writeText(info.code);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
+      await navigator.clipboard.writeText(text);
+      setCopied(which);
+      setTimeout(() => setCopied(""), 1500);
     } catch {
-      /* clipboard may be unavailable; the code is shown on screen anyway */
+      /* clipboard may be unavailable; values are shown on screen anyway */
     }
   };
 
   const regen = async () => {
-    if (!confirm("Generate a new family code? The old code will stop working, so anyone you shared it with can't use it to join anymore.")) return;
+    if (!confirm("Generate a new family code? The old code AND the current kids' link will stop working — you'll need to re-share the new link and bookmark it again on your kids' tablet.")) return;
     setBusy(true);
     try {
       const code = await api.familyRegenCode();
@@ -2251,23 +2949,44 @@ function FamilyManager() {
     <div className="sq-card" style={panel}>
       <h2 className="sq-h" style={{ ...h2, marginTop: 0 }}>Your Family</h2>
       <p style={{ color: "#7a6f8c", marginTop: -8 }}>
-        Everyone in your family shares the same kids and progress. Invite another parent by sharing this code —
-        they create their own login and pick "Join an existing family" when signing up.
+        Everyone in your family shares the same kids and progress.
       </p>
       {err && <div style={errBox}>{err}</div>}
 
-      <div style={{ marginTop: 6 }}>
-        <div style={lbl}>Family invite code</div>
+      {/* Kids' no-login link */}
+      <div style={{ marginTop: 6, padding: 14, background: "#eef7f0", borderRadius: 14, border: "1px solid #cdeccf" }}>
+        <div style={{ ...lbl, marginTop: 0, color: "#2f7a45" }}>🧒 Kids' access link (no password needed)</div>
+        <p style={{ fontSize: 13, color: "#4f6f58", margin: "0 0 10px" }}>
+          Open this link on your kids' tablet and bookmark it / add it to the home screen. It opens StudyQuest straight
+          into your family — no login — so kids never need your password.
+        </p>
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <code style={{ flex: 1, minWidth: 200, fontSize: 13, background: "#fff", padding: "10px 12px", borderRadius: 10, color: "#2f7a45", wordBreak: "break-all", border: "1px solid #cdeccf" }}>
+            {kidsLink || "…"}
+          </code>
+          <button style={{ ...btnGhost, borderColor: "#2fa84f", color: "#2f7a45" }} onClick={() => copy(kidsLink, "link")} disabled={!kidsLink}>
+            {copied === "link" ? "✓ Copied" : "📋 Copy link"}
+          </button>
+        </div>
+      </div>
+
+      {/* Co-parent invite code */}
+      <div style={{ marginTop: 18 }}>
+        <div style={lbl}>👨‍👩‍👧 Co-parent invite code</div>
+        <p style={{ fontSize: 13, color: "#7a6f8c", margin: "0 0 8px" }}>
+          To give another parent their own login (with email + password), share this code. They sign up and pick
+          "Join an existing family."
+        </p>
         <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
           <code style={{ fontSize: 20, fontWeight: 800, letterSpacing: ".08em", background: "#f6f3fb", padding: "10px 16px", borderRadius: 12, color: "#4a3f5e", fontFamily: FONT_DISPLAY }}>
             {info ? info.code || "—" : "…"}
           </code>
-          <button style={btnGhost} onClick={copy} disabled={!info || !info.code}>{copied ? "✓ Copied" : "📋 Copy"}</button>
+          <button style={btnGhost} onClick={() => copy(info && info.code, "code")} disabled={!info || !info.code}>{copied === "code" ? "✓ Copied" : "📋 Copy"}</button>
           <button style={{ ...btnGhost, borderColor: "#e0506b", color: "#e0506b" }} onClick={regen} disabled={busy}>
             {busy ? "…" : "↻ New code"}
           </button>
         </div>
-        <div style={{ fontSize: 12, color: "#9a8fb0", marginTop: 6 }}>Treat this like a password — only share it with people who should see your kids.</div>
+        <div style={{ fontSize: 12, color: "#9a8fb0", marginTop: 6 }}>Treat the code and link like a password — only share with people who should see your kids. Making a new code revokes the old link too.</div>
       </div>
 
       <h3 className="sq-h" style={{ fontSize: 18, marginTop: 22, marginBottom: 8 }}>Parents in this family</h3>
@@ -2278,10 +2997,11 @@ function FamilyManager() {
       ) : (
         <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
           {info.members.map((m) => (
-            <div key={m.username} style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 12px", background: "#f6f3fb", borderRadius: 10 }}>
-              <span style={{ fontWeight: 800, fontFamily: FONT_DISPLAY }}>{m.username}</span>
+            <div key={m.email} style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 12px", background: "#f6f3fb", borderRadius: 10 }}>
+              <span style={{ fontWeight: 800, fontFamily: FONT_DISPLAY, wordBreak: "break-all" }}>{m.email}</span>
               {m.isYou && <span style={{ fontSize: 12, color: "#2fa84f", fontWeight: 800 }}>· you</span>}
               {m.isAdmin && <span style={{ fontSize: 12, color: "#9b4dca", fontWeight: 800 }}>· admin</span>}
+              {!m.verified && !m.isAdmin && <span style={{ fontSize: 12, color: "#b8702a", fontWeight: 800 }}>· unverified</span>}
             </div>
           ))}
         </div>
@@ -2292,11 +3012,12 @@ function FamilyManager() {
 
 /* ------------------------------ account manager ------------------------- */
 function AccountManager({ parent, setParent }) {
-  // username
-  const [username, setUsername] = useState(parent.username);
-  const [uMsg, setUMsg] = useState("");
-  const [uErr, setUErr] = useState("");
-  const [uBusy, setUBusy] = useState(false);
+  // email
+  const [email, setEmail] = useState(parent.email || "");
+  const [eMsg, setEMsg] = useState("");
+  const [eErr, setEErr] = useState("");
+  const [eBusy, setEBusy] = useState(false);
+  const [reverify, setReverify] = useState(false);
   // password
   const [cur, setCur] = useState("");
   const [n1, setN1] = useState("");
@@ -2306,20 +3027,27 @@ function AccountManager({ parent, setParent }) {
   const [pBusy, setPBusy] = useState(false);
 
   const isAdmin = !!parent.isAdmin;
+  const isEmailish = (v) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v.trim());
 
-  const saveUsername = async () => {
-    setUMsg("");
-    setUErr("");
-    if (username.trim() === parent.username) return setUErr("That's already your username.");
-    setUBusy(true);
+  const saveEmail = async () => {
+    setEMsg("");
+    setEErr("");
+    if (!isEmailish(email)) return setEErr("Enter a valid email address.");
+    if (email.trim().toLowerCase() === (parent.email || "").toLowerCase()) return setEErr("That's already your email.");
+    if (!confirm("Change your email? You'll need to verify the new address from a link we email you, and you'll be signed out until you do.")) return;
+    setEBusy(true);
     try {
-      const updated = await api.changeUsername(username.trim());
-      setParent((p) => ({ ...p, username: updated }));
-      setUMsg("Username updated.");
+      await api.changeEmail(email.trim());
+      setReverify(true);
+      // changing email makes the account unverified -> sign out after a moment
+      setTimeout(() => {
+        api.logout();
+        window.dispatchEvent(new Event("sq-unauthorized"));
+      }, 3500);
     } catch (e) {
-      setUErr(e.message || "Could not change username.");
+      setEErr(e.message || "Could not change email.");
     } finally {
-      setUBusy(false);
+      setEBusy(false);
     }
   };
 
@@ -2345,18 +3073,24 @@ function AccountManager({ parent, setParent }) {
   return (
     <div>
       <div className="sq-card" style={{ ...panel, maxWidth: 460 }}>
-        <h2 className="sq-h" style={{ ...h2, marginTop: 0 }}>Username</h2>
+        <h2 className="sq-h" style={{ ...h2, marginTop: 0 }}>Email</h2>
         {isAdmin ? (
           <p style={{ color: "#7a6f8c" }}>
-            You're signed in as the <strong>admin</strong> account. The admin username can't be changed.
+            You're signed in as the <strong>admin</strong> account. Its email can't be changed.
           </p>
+        ) : reverify ? (
+          <div style={{ ...errBox, background: "#eef4fb", color: "#3b5b8e" }}>
+            We've sent a verification link to <strong>{email.trim()}</strong>. Click it to confirm your new email.
+            Signing you out now…
+          </div>
         ) : (
           <>
-            <input style={input} value={username} onChange={(e) => setUsername(e.target.value)} autoCapitalize="none" autoCorrect="off" />
-            {uErr && <div style={errBox}>{uErr}</div>}
-            {uMsg && <div style={{ ...errBox, background: "#eefaf0", color: "#2fa84f" }}>{uMsg}</div>}
-            <button style={{ ...btnPrimary, opacity: uBusy ? 0.6 : 1 }} disabled={uBusy} onClick={saveUsername}>
-              {uBusy ? "Saving…" : "Save username"}
+            <input style={input} type="email" value={email} onChange={(e) => setEmail(e.target.value)} autoCapitalize="none" autoCorrect="off" placeholder="you@example.com" />
+            <div style={{ fontSize: 12, color: "#9a8fb0", marginTop: 4 }}>Changing your email requires verifying the new address.</div>
+            {eErr && <div style={errBox}>{eErr}</div>}
+            {eMsg && <div style={{ ...errBox, background: "#eefaf0", color: "#2fa84f" }}>{eMsg}</div>}
+            <button style={{ ...btnPrimary, opacity: eBusy ? 0.6 : 1 }} disabled={eBusy} onClick={saveEmail}>
+              {eBusy ? "Saving…" : "Save email"}
             </button>
           </>
         )}
@@ -2399,14 +3133,14 @@ function AdminPanel({ meUsername }) {
     load();
   }, []);
 
-  const doReset = async (username) => {
+  const doReset = async (email) => {
     setMsg("");
     setErr("");
     if (newPw.length < 6) return setErr("New password must be at least 6 characters.");
     setBusy(true);
     try {
-      await api.adminResetPassword(username, newPw);
-      setMsg(`Password reset for "${username}". Share the new password with them; they can change it after logging in.`);
+      await api.adminResetPassword(email, newPw);
+      setMsg(`Password reset for "${email}". Share the new password with them; they can change it after logging in.`);
       setResetFor(null);
       setNewPw("");
     } catch (e) {
@@ -2431,23 +3165,24 @@ function AdminPanel({ meUsername }) {
         <p style={{ color: "#7a6f8c" }}>No accounts yet.</p>
       ) : (
         users.map((u) => (
-          <div key={u.username} style={{ padding: "12px 0", borderBottom: "1px solid #f0ecf6" }}>
+          <div key={u.email} style={{ padding: "12px 0", borderBottom: "1px solid #f0ecf6" }}>
             <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-              <span style={{ fontWeight: 800, fontFamily: FONT_DISPLAY }}>
-                {u.username}
+              <span style={{ fontWeight: 800, fontFamily: FONT_DISPLAY, wordBreak: "break-all" }}>
+                {u.email}
                 {u.isAdmin && <span style={{ marginLeft: 6, fontSize: 12, color: "#9b4dca", fontWeight: 800 }}>· ADMIN</span>}
+                {!u.isAdmin && !u.verified && <span style={{ marginLeft: 6, fontSize: 12, color: "#b8702a", fontWeight: 800 }}>· unverified</span>}
               </span>
               <span style={{ color: "#9a8fb0", fontSize: 13 }}>
                 {u.kidCount} kid{u.kidCount === 1 ? "" : "s"}
               </span>
               <div style={{ flex: 1 }} />
-              {resetFor === u.username ? null : (
-                <button style={btnGhost} onClick={() => { setResetFor(u.username); setNewPw(""); setMsg(""); setErr(""); }}>
+              {resetFor === u.email ? null : (
+                <button style={btnGhost} onClick={() => { setResetFor(u.email); setNewPw(""); setMsg(""); setErr(""); }}>
                   Reset password
                 </button>
               )}
             </div>
-            {resetFor === u.username && (
+            {resetFor === u.email && (
               <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap", alignItems: "center" }}>
                 <input
                   style={{ ...input, margin: 0, maxWidth: 240 }}
@@ -2455,10 +3190,10 @@ function AdminPanel({ meUsername }) {
                   value={newPw}
                   onChange={(e) => setNewPw(e.target.value)}
                   placeholder="New password (min 6)"
-                  onKeyDown={(e) => e.key === "Enter" && doReset(u.username)}
+                  onKeyDown={(e) => e.key === "Enter" && doReset(u.email)}
                   autoFocus
                 />
-                <button style={{ ...btnPrimary, marginTop: 0, opacity: busy ? 0.6 : 1 }} disabled={busy} onClick={() => doReset(u.username)}>
+                <button style={{ ...btnPrimary, marginTop: 0, opacity: busy ? 0.6 : 1 }} disabled={busy} onClick={() => doReset(u.email)}>
                   {busy ? "Saving…" : "Set password"}
                 </button>
                 <button style={btnGhost} onClick={() => { setResetFor(null); setNewPw(""); }}>Cancel</button>
@@ -2628,14 +3363,27 @@ function KidsManager({ kids, refreshKids, activeKid, setActiveKid }) {
   const [grade, setGrade] = useState(3);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
-  // local buffer for name edits so we only save on blur (not every keystroke)
-  const [names, setNames] = useState({});
+  // Local authoritative copy of the list. We update it DIRECTLY from each API
+  // response so the visible list changes the instant the server replies,
+  // independent of parent re-render timing. Also kept in sync if props change.
+  const [rows, setRows] = useState(kids);
+  const [names, setNames] = useState({}); // name edit buffer (save on blur)
 
   useEffect(() => {
+    setRows(kids);
     const map = {};
     kids.forEach((k) => (map[k.id] = k.name));
     setNames(map);
   }, [kids]);
+
+  // apply a server-returned array everywhere: local list + name buffer + app
+  const applyList = (ks) => {
+    setRows(ks);
+    const map = {};
+    ks.forEach((k) => (map[k.id] = k.name));
+    setNames(map);
+    refreshKids(ks); // propagate to header switcher + the rest of the app
+  };
 
   const add = async () => {
     if (!name.trim()) return;
@@ -2643,9 +3391,9 @@ function KidsManager({ kids, refreshKids, activeKid, setActiveKid }) {
     setBusy(true);
     try {
       const ks = await api.createKid(name.trim(), Number(grade));
-      setName("");
       const created = ks[ks.length - 1];
-      await refreshKids(ks); // use the authoritative list from the create call
+      applyList(ks);
+      setName("");
       if (created) setActiveKid(created.id);
     } catch (e) {
       setErr(e.message || "Could not add child.");
@@ -2656,38 +3404,48 @@ function KidsManager({ kids, refreshKids, activeKid, setActiveKid }) {
 
   const commitName = async (id) => {
     const newName = (names[id] || "").trim();
-    const current = kids.find((k) => k.id === id);
+    const current = rows.find((k) => k.id === id);
     if (!current || !newName || newName === current.name) return;
+    setErr("");
     try {
       const ks = await api.updateKid(id, { name: newName });
-      await refreshKids(ks);
-    } catch {
-      /* leave UI; will reset on next refresh */
+      applyList(ks);
+    } catch (e) {
+      setErr(e.message || "Could not rename child.");
     }
   };
 
   const updateGrade = async (id, g) => {
+    setErr("");
     try {
       const ks = await api.updateKid(id, { grade: Number(g) });
-      await refreshKids(ks);
-    } catch {}
+      applyList(ks);
+    } catch (e) {
+      setErr(e.message || "Could not update grade.");
+    }
   };
 
   const remove = async (id) => {
     if (!confirm("Remove this child and all of their saved questions and chores? This cannot be undone.")) return;
+    setErr("");
     try {
       const ks = await api.deleteKid(id);
-      await refreshKids(ks);
+      applyList(ks);
       if (activeKid === id) setActiveKid(ks[0]?.id || null);
-    } catch {}
+    } catch (e) {
+      setErr(e.message || "Could not remove child.");
+    }
   };
 
   return (
     <div className="sq-card" style={panel}>
       <h2 className="sq-h" style={{ ...h2, marginTop: 0 }}>Kids & Grade Levels</h2>
-      <p style={{ color: "#7a6f8c", marginTop: -8 }}>Grade level sets the difficulty of generated questions. Only you can see these kids.</p>
+      <p style={{ color: "#7a6f8c", marginTop: -8 }}>Grade level sets the difficulty of generated questions. Everyone in your family sees these kids.</p>
+      {err && <div style={errBox}>{err}</div>}
 
-      {kids.map((k) => (
+      {rows.length === 0 && <p style={{ color: "#9a8fb0" }}>No kids yet — add one below.</p>}
+
+      {rows.map((k) => (
         <div key={k.id} style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap", padding: "12px 0", borderBottom: "1px solid #f0ecf6" }}>
           <input
             style={{ ...input, margin: 0, maxWidth: 200 }}
@@ -2713,7 +3471,6 @@ function KidsManager({ kids, refreshKids, activeKid, setActiveKid }) {
           </select>
           <button style={{ ...btnPrimary, opacity: busy ? 0.6 : 1 }} disabled={busy} onClick={add}>{busy ? "Adding…" : "+ Add child"}</button>
         </div>
-        {err && <div style={errBox}>{err}</div>}
       </div>
     </div>
   );
