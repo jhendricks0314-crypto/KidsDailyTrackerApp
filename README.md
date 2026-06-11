@@ -373,3 +373,35 @@ set that already has questions is always kept and **never regenerated**, even if
 it's barely started (well under 50% answered). Combined with "all answers
 required before checking" and the per-family rate limits, this keeps Anthropic
 API calls to roughly one generation per child per day.
+
+## Build/deploy troubleshooting
+
+**"Build failed on Netlify" / Node version errors (e.g. `node-sass` won't
+install on Node 22):** StudyQuest itself has **no** Sass/`node-sass` dependency —
+if you see that error, Netlify is almost certainly building a *different* repo
+or older code, not this project. Make sure the repo Netlify deploys contains
+**these** files (this `package.json` lists only React, Vite, and
+`@netlify/blobs`). Replace the old repo contents with everything from this
+package and push.
+
+This project pins the build to **Node 20** (via `netlify.toml` →
+`[build.environment] NODE_VERSION = "20"`, and `.nvmrc`) so deploys stay
+predictable even if Netlify changes its default Node version.
+
+## Answer grading: injection safety
+
+Student answers are treated strictly as data, never as instructions:
+
+- The AI grader is used as text-in/text-out only — there are **no tools, no code
+  execution, and no agent actions** available to it, so an answer like "build me
+  a program" has nothing to trigger; it's just graded as a wrong answer.
+- The grading prompt explicitly tells the model to treat each answer as
+  untrusted child input and to never follow instructions inside it.
+- All inputs are coerced to strings, stripped of control characters, and
+  length-capped before use.
+- The grading result is **reconciled against the questions that were sent**: the
+  response always has exactly one verdict per question (matched by item number),
+  and any missing, extra, duplicated, or malformed entry **fails safe to
+  "incorrect."** Only a strict `correct: true` counts as correct, and non-JSON
+  model output is rejected. So a manipulated answer can't force a pass or change
+  how many questions were graded.

@@ -5,6 +5,12 @@
   publish = "dist"
   functions = "netlify/functions"
 
+# Pin the build to a stable, supported Node version so deploys are predictable
+# and don't break when Netlify changes its default (e.g. to Node 22). Node 20
+# is the current LTS and builds this project cleanly.
+[build.environment]
+  NODE_VERSION = "20"
+
 # During local `netlify dev`, run Vite as the dev server
 [dev]
   command = "npm run dev"
