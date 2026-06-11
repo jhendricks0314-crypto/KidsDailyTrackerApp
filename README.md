@@ -56,10 +56,6 @@ Set these in **Netlify → Site configuration → Environment variables**:
 
 Generate a good `SESSION_SECRET`:
 
-```bash
-node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"
-```
-
 > Note: changing `SESSION_SECRET` later logs everyone out (they just log back in).
 
 ---
@@ -91,7 +87,6 @@ netlify login
 netlify init            # link/create a site
 
 netlify env:set ANTHROPIC_API_KEY "sk-ant-your-key-here"
-netlify env:set SESSION_SECRET "$(node -e "console.log(require('crypto').randomBytes(48).toString('hex'))")"
 # optional:
 netlify env:set ANTHROPIC_MODEL "claude-sonnet-4-6"
 
