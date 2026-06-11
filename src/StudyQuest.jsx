@@ -27,13 +27,13 @@ const fmtDate = (key) => {
 
 const uid = () => Math.random().toString(36).slice(2, 10);
 
-// Remove ?verify= / ?family= from the address bar after we've consumed them,
-// so a refresh or shared screenshot doesn't re-trigger or leak the code.
+// Remove ?verify= / ?family= / ?invite= from the address bar after we've
+// consumed them, so a refresh or shared screenshot doesn't re-trigger or leak.
 const cleanUrl = () => {
   try {
     const url = new URL(window.location.href);
     let changed = false;
-    for (const p of ["verify", "family"]) {
+    for (const p of ["verify", "family", "invite"]) {
       if (url.searchParams.has(p)) {
         url.searchParams.delete(p);
         changed = true;
@@ -127,8 +127,8 @@ async function apiRequest(action, body) {
 
 const api = {
   // Returns { pending, email, ... } — account must be verified by email.
-  async signup(email, password, familyCode) {
-    return apiRequest("signup", { email, password, familyCode });
+  async signup(email, password, familyCode, familyName) {
+    return apiRequest("signup", { email, password, familyCode, familyName });
   },
   // Returns the parent object on success; throws with err.data.unverified if not verified.
   async login(email, password) {
@@ -149,6 +149,14 @@ const api = {
     const r = await apiRequest("family-access", { code });
     setFamilyToken(r.token);
     return true;
+  },
+  // Already-logged-in parent joins a family by invite code.
+  async familyJoin(code) {
+    return apiRequest("family-join", { code });
+  },
+  // Preview consequences of joining (so we can confirm before deleting old family).
+  async familyJoinPreview(code) {
+    return apiRequest("family-join-preview", { code });
   },
   logout() {
     setToken(null);
@@ -177,13 +185,17 @@ const api = {
   async familyInfo() {
     return apiRequest("family-info");
   },
+  async familyRename(name) {
+    return apiRequest("family-rename", { name });
+  },
   async familyRegenCode() {
     const r = await apiRequest("family-regen-code");
     return r && r.code;
   },
+  // Returns { kids, familyName }
   async listKids() {
     const r = await apiRequest("kids-list");
-    return (r && r.kids) || [];
+    return { kids: (r && r.kids) || [], familyName: (r && r.familyName) || "" };
   },
   async createKid(name, grade) {
     const r = await apiRequest("kid-create", { name, grade });
@@ -224,6 +236,12 @@ const api = {
   },
   async adminResetPassword(email, newPassword) {
     return apiRequest("admin-reset-password", { email, newPassword });
+  },
+  async adminLogs(filters) {
+    return apiRequest("admin-logs", filters || {});
+  },
+  async adminLogClear(olderThan) {
+    return apiRequest("admin-log-clear", olderThan ? { olderThan } : {});
   },
 };
 
@@ -424,37 +442,66 @@ function svgRectangle(w, h) {
       `<text x="${x - 10}" y="${y + ph / 2 + 5}" text-anchor="end" font-family="sans-serif" font-size="16" fill="#4a3f5e" font-weight="700">${h}</text>`
   );
 }
-function svgBarChart(data) {
-  const max = Math.max(...data.map((d) => d.value), 1);
-  const W = 240, H = 170, pad = 28, bw = (W - pad * 2) / data.length;
-  let bars = `<line x1="${pad}" y1="${H - pad}" x2="${W - 6}" y2="${H - pad}" stroke="#999" stroke-width="1.5"/>`;
-  bars += `<line x1="${pad}" y1="10" x2="${pad}" y2="${H - pad}" stroke="#999" stroke-width="1.5"/>`;
-  data.forEach((d, i) => {
-    const bh = ((H - pad - 14) * d.value) / max;
-    const x = pad + i * bw + bw * 0.18;
-    const y = H - pad - bh;
-    const w = bw * 0.64;
-    bars += `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${w.toFixed(1)}" height="${bh.toFixed(1)}" fill="#3b7de8" rx="3"/>`;
-    bars += `<text x="${(x + w / 2).toFixed(1)}" y="${H - pad + 14}" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#555">${d.label}</text>`;
-  });
-  return svgWrap(bars);
+// Build "nice" y-axis tick values from 0..max (integer data 1-10).
+function yTicks(max) {
+  const m = Math.max(1, Math.ceil(max));
+  // aim for ~5 ticks; step is 1 or 2 for small ranges
+  const step = m <= 6 ? 1 : 2;
+  const ticks = [];
+  for (let v = 0; v <= m; v += step) ticks.push(v);
+  if (ticks[ticks.length - 1] !== m) ticks.push(m);
+  return { ticks, top: m };
 }
-function svgLineChart(data) {
-  const max = Math.max(...data.map((d) => d.value), 1);
-  const W = 240, H = 170, pad = 28, step = (W - pad * 2) / (data.length - 1);
-  const pts = data.map((d, i) => {
-    const x = pad + i * step;
-    const y = H - pad - ((H - pad - 14) * d.value) / max;
-    return [x, y];
+
+function svgBarChart(data) {
+  const W = 280, H = 190, padL = 30, padR = 10, padB = 26, padT = 10;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  const { ticks, top } = yTicks(Math.max(...data.map((d) => d.value), 1));
+  const yOf = (v) => padT + plotH - (plotH * v) / top;
+  const bw = plotW / data.length;
+
+  let svg = "";
+  // horizontal gridlines + y-axis number labels
+  ticks.forEach((t) => {
+    const y = yOf(t);
+    svg += `<line x1="${padL}" y1="${y.toFixed(1)}" x2="${(W - padR).toFixed(1)}" y2="${y.toFixed(1)}" stroke="${t === 0 ? "#999" : "#e6e6e6"}" stroke-width="1"/>`;
+    svg += `<text x="${padL - 6}" y="${(y + 4).toFixed(1)}" text-anchor="end" font-family="sans-serif" font-size="11" fill="#555">${t}</text>`;
   });
-  let svg = `<line x1="${pad}" y1="${H - pad}" x2="${W - 6}" y2="${H - pad}" stroke="#999" stroke-width="1.5"/>`;
-  svg += `<line x1="${pad}" y1="10" x2="${pad}" y2="${H - pad}" stroke="#999" stroke-width="1.5"/>`;
+  // y-axis line
+  svg += `<line x1="${padL}" y1="${padT}" x2="${padL}" y2="${(padT + plotH).toFixed(1)}" stroke="#999" stroke-width="1.5"/>`;
+  // bars + x labels
+  data.forEach((d, i) => {
+    const x = padL + i * bw + bw * 0.2;
+    const w = bw * 0.6;
+    const y = yOf(d.value);
+    const h = padT + plotH - y;
+    svg += `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${w.toFixed(1)}" height="${h.toFixed(1)}" fill="#3b7de8" rx="3"/>`;
+    svg += `<text x="${(x + w / 2).toFixed(1)}" y="${(padT + plotH + 16).toFixed(1)}" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#555">${d.label}</text>`;
+  });
+  return svgWrap(svg, W, H);
+}
+
+function svgLineChart(data) {
+  const W = 280, H = 190, padL = 30, padR = 10, padB = 26, padT = 10;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  const { ticks, top } = yTicks(Math.max(...data.map((d) => d.value), 1));
+  const yOf = (v) => padT + plotH - (plotH * v) / top;
+  const step = plotW / (data.length - 1);
+  const pts = data.map((d, i) => [padL + i * step, yOf(d.value)]);
+
+  let svg = "";
+  ticks.forEach((t) => {
+    const y = yOf(t);
+    svg += `<line x1="${padL}" y1="${y.toFixed(1)}" x2="${(W - padR).toFixed(1)}" y2="${y.toFixed(1)}" stroke="${t === 0 ? "#999" : "#e6e6e6"}" stroke-width="1"/>`;
+    svg += `<text x="${padL - 6}" y="${(y + 4).toFixed(1)}" text-anchor="end" font-family="sans-serif" font-size="11" fill="#555">${t}</text>`;
+  });
+  svg += `<line x1="${padL}" y1="${padT}" x2="${padL}" y2="${(padT + plotH).toFixed(1)}" stroke="#999" stroke-width="1.5"/>`;
   svg += `<polyline points="${pts.map((p) => `${p[0].toFixed(1)},${p[1].toFixed(1)}`).join(" ")}" fill="none" stroke="#2fa84f" stroke-width="2.5"/>`;
   pts.forEach((p, i) => {
     svg += `<circle cx="${p[0].toFixed(1)}" cy="${p[1].toFixed(1)}" r="4" fill="#2fa84f"/>`;
-    svg += `<text x="${p[0].toFixed(1)}" y="${H - pad + 14}" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#555">${data[i].label}</text>`;
+    svg += `<text x="${p[0].toFixed(1)}" y="${(padT + plotH + 16).toFixed(1)}" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#555">${data[i].label}</text>`;
   });
-  return svgWrap(svg);
+  return svgWrap(svg, W, H);
 }
 function svgCoordPoint(px, py) {
   const W = 200, H = 200, pad = 24, span = 6, unit = (W - pad * 2) / span;
@@ -649,6 +696,17 @@ function selectedCategoriesFor(subjectKey, kid) {
 
 const blankItem = (item) => ({ ...item, response: "", checked: false, correct: null, misses: 0, help: "" });
 
+// How many questions to generate for a subject for this kid (parent-set, 0-20).
+// Default is 10. 0 means "skip this subject".
+function countFor(subjectKey, kid) {
+  const c = kid && kid.counts && kid.counts[subjectKey];
+  if (c === 0) return 0;
+  if (c == null || c === "") return 10; // no per-subject value set -> default
+  const n = Math.round(Number(c));
+  if (Number.isFinite(n) && n >= 0 && n <= 20) return n;
+  return 10;
+}
+
 // Procedural Math: round-robin across the selected operation categories.
 function buildMathList(grade, categories, count = 10) {
   const cats = categories && categories.length ? categories : mathCategoriesForGrade(grade);
@@ -726,26 +784,28 @@ async function buildDay(grade, kid) {
   const out = {};
   const aiRequests = []; // {subject, categories, count}
 
-  // ----- Math: split 10 questions between built-in (procedural) and custom (AI)
+  // ----- Math: split the kid's Math count between built-in (procedural) and custom (AI)
+  const mathTotal = countFor("Math", kid);
   const mathSplit = splitCategories("Math", kid);
   let mathCustomCount = 0;
-  if (mathSplit.customSel.length) {
+  if (mathTotal > 0 && mathSplit.customSel.length) {
     const total = mathSplit.builtInSel.length + mathSplit.customSel.length;
-    mathCustomCount = Math.round((mathSplit.customSel.length / total) * 10);
+    mathCustomCount = Math.round((mathSplit.customSel.length / total) * mathTotal);
     if (mathCustomCount === 0) mathCustomCount = 1;
-    if (mathSplit.builtInSel.length === 0) mathCustomCount = 10;
-    mathCustomCount = Math.min(10, mathCustomCount);
+    if (mathSplit.builtInSel.length === 0) mathCustomCount = mathTotal;
+    mathCustomCount = Math.min(mathTotal, mathCustomCount);
   }
-  const mathBuiltInCount = 10 - mathCustomCount;
+  const mathBuiltInCount = mathTotal - mathCustomCount;
   out["Math"] = mathBuiltInCount > 0 ? buildMathList(grade, mathSplit.builtInSel, mathBuiltInCount) : [];
   if (mathCustomCount > 0) {
     aiRequests.push({ subject: "Math", categories: mathSplit.customSel, count: mathCustomCount });
   }
 
-  // ----- Text subjects: all selected categories are AI-generated
+  // ----- Text subjects: AI-generated, honoring each subject's count (skip if 0)
   const textSubjects = SUBJECTS.filter((s) => s.key !== "Math");
   for (const s of textSubjects) {
-    aiRequests.push({ subject: s.key, categories: selectedCategoriesFor(s.key, kid), count: 10 });
+    const n = countFor(s.key, kid);
+    if (n > 0) aiRequests.push({ subject: s.key, categories: selectedCategoriesFor(s.key, kid), count: n });
   }
 
   // ----- one AI call for everything that needs generating
@@ -760,13 +820,18 @@ async function buildDay(grade, kid) {
 
   // merge text subjects (AI, with curated fallback)
   for (const s of textSubjects) {
+    const n = countFor(s.key, kid);
+    if (n === 0) {
+      out[s.key] = [];
+      continue;
+    }
     const gen = generated && generated[s.key];
     if (gen && gen.length) {
       let list = gen.map((it) => blankItem({ type: "text", q: it.q, a: it.a, accept: [it.a], category: it.category || "" }));
-      while (list.length < 10) list.push(blankItem(SUBJECTS.find((x) => x.key === s.key).gen(grade)));
-      out[s.key] = list.slice(0, 10);
+      while (list.length < n) list.push(blankItem(SUBJECTS.find((x) => x.key === s.key).gen(grade)));
+      out[s.key] = list.slice(0, n);
     } else {
-      out[s.key] = buildTextListFallback(s.key, grade);
+      out[s.key] = buildTextListFallback(s.key, grade).slice(0, n);
     }
   }
 
@@ -778,10 +843,10 @@ async function buildDay(grade, kid) {
       mathGen.map((it) => blankItem({ type: "math", q: it.q, a: it.a, accept: [it.a], category: it.category || "" }))
     );
   }
-  while (mathList.length < 10) {
+  while (mathList.length < mathTotal) {
     mathList.push(blankItem(genMath(grade, pick(mathCategoriesForGrade(grade)))));
   }
-  out["Math"] = mathList.slice(0, 10);
+  out["Math"] = mathList.slice(0, mathTotal);
 
   return out;
 }
@@ -990,9 +1055,12 @@ export default function App() {
   const [parent, setParent] = useState(null); // parent object when logged in
   const [familyMode, setFamilyMode] = useState(false); // kid-mode via family link (no login)
   const [parentMode, setParentMode] = useState(false);
+  const [parentUnlocked, setParentUnlocked] = useState(false); // session unlock for parent area
   const [adminInitialized, setAdminInitialized] = useState(true); // assume yes until checked
   const [setupProtected, setSetupProtected] = useState(false);
   const [verifyState, setVerifyState] = useState(null); // {status:'working'|'error', message}
+  const [inviteCode, setInviteCode] = useState(""); // co-parent invite link prefill
+  const [familyName, setFamilyName] = useState(""); // shown in the header
 
   // data
   const [kids, setKids] = useState([]);
@@ -1004,7 +1072,6 @@ export default function App() {
 
   // ui
   const [tab, setTab] = useState("study"); // study | chores | calendar
-  const [calMode, setCalMode] = useState("study");
   const [showReward, setShowReward] = useState(false); // reward game modal
   const [choreCeleb, setChoreCeleb] = useState(null); // celebration popup when all chores done
   const choreCelebRef = useRef({}); // `${kid}:${date}` shown already this session
@@ -1018,6 +1085,7 @@ export default function App() {
     api.logout();
     setParent(null);
     setParentMode(false);
+    setParentUnlocked(false); // require password again next session
     if (getFamilyToken()) {
       setFamilyMode(true);
     } else {
@@ -1041,8 +1109,9 @@ export default function App() {
   }, []);
 
   const loadKidsInto = useCallback(async () => {
-    const ks = await api.listKids();
+    const { kids: ks, familyName } = await api.listKids();
     setKids(ks);
+    setFamilyName(familyName || "");
     setActiveKid((cur) => (ks.some((k) => k.id === cur) ? cur : ks[0]?.id || null));
     return ks;
   }, []);
@@ -1053,6 +1122,17 @@ export default function App() {
       const params = new URLSearchParams(window.location.search);
       const verifyTok = params.get("verify");
       const familyCode = params.get("family");
+      const invite = params.get("invite");
+
+      // Co-parent invite link: ?invite=<code> -> remember it and show the auth
+      // screen pre-filled to join that family (they log in or sign up).
+      if (invite) {
+        setInviteCode(invite.trim().toUpperCase());
+        cleanUrl();
+        // If a parent session somehow exists already, drop it so they can choose
+        // to log in / sign up as the invited co-parent.
+        // (We just show the auth screen; existing token stays valid if they cancel.)
+      }
 
       // 1) Email verification link: ?verify=<token>
       if (verifyTok) {
@@ -1136,6 +1216,7 @@ export default function App() {
   const handleAuthed = async (parentObj) => {
     setParent(parentObj);
     setFamilyMode(false);
+    setInviteCode(""); // consume any pending invite once authed
     setLoading(true);
     try {
       await loadKidsInto();
@@ -1148,7 +1229,14 @@ export default function App() {
   // create/update/delete call already returned) to update instantly without a
   // second fetch that could momentarily return stale data.
   const refreshKids = useCallback(async (known) => {
-    const ks = Array.isArray(known) ? known : await api.listKids();
+    let ks;
+    if (Array.isArray(known)) {
+      ks = known;
+    } else {
+      const res = await api.listKids();
+      ks = res.kids;
+      setFamilyName(res.familyName || "");
+    }
     setKids(ks);
     setActiveKid((cur) => (ks.some((k) => k.id === cur) ? cur : ks[0]?.id || null));
     return ks;
@@ -1214,24 +1302,34 @@ export default function App() {
   };
 
   /* ---------- reward game: all questions correct + all today's chores done ---------- */
+  // Only consider subjects that actually have questions today (a parent can set
+  // a subject to 0). Require at least one question overall.
+  const activeSubjectLists = day
+    ? SUBJECTS.map((s) => day[s.key]).filter((l) => Array.isArray(l) && l.length > 0)
+    : [];
+  const hasAnyQuestions = activeSubjectLists.length > 0;
+
   const allQuestionsCorrect =
-    !!day &&
-    SUBJECTS.every((s) => Array.isArray(day[s.key]) && day[s.key].length > 0 && day[s.key].every((it) => it.correct === true));
+    hasAnyQuestions && activeSubjectLists.every((l) => l.every((it) => it.correct === true));
 
   // "Done with questions" = every question has been answered AND checked at
   // least once (regardless of right/wrong). This is the trigger for the
   // questions+answers email.
   const allQuestionsChecked =
-    !!day &&
-    SUBJECTS.every((s) => Array.isArray(day[s.key]) && day[s.key].length > 0 && day[s.key].every((it) => it.checked === true));
+    hasAnyQuestions && activeSubjectLists.every((l) => l.every((it) => it.checked === true));
 
   const choresToday = chores.filter(choreAppliesToday);
   const choresExistToday = choresToday.length > 0;
   const allChoresDone = choresToday.length === 0 || choresToday.every((c) => (choreLog[c.id] || {}).completed === "yes");
 
   const rewardEarned = allQuestionsCorrect && allChoresDone;
+  const rewardPlays = (day && day.__rewardPlays) || 0;
+  const REWARD_MAX_PLAYS = 3;
+  const [rewardDismissed, setRewardDismissed] = useState(false);
+  // show the ribbon only if: earned, plays remain, and not closed by the kid
+  const showRibbon = rewardEarned && rewardPlays < REWARD_MAX_PLAYS && !rewardDismissed;
 
-  // auto-pop the game once per day per kid (guard persisted inside the day object)
+  // auto-pop the game ONCE per day per kid (first time it's earned)
   useEffect(() => {
     if (rewardEarned && day && !day.__rewardShown) {
       setShowReward(true);
@@ -1239,6 +1337,19 @@ export default function App() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [rewardEarned]);
+
+  // count a play and close the game; after REWARD_MAX_PLAYS the ribbon stops showing
+  const finishReward = useCallback(() => {
+    setShowReward(false);
+    setDay((prev) => {
+      if (!prev) return prev;
+      const plays = (prev.__rewardPlays || 0) + 1;
+      const next = { ...prev, __rewardPlays: plays };
+      // persist (fire and forget)
+      if (activeKid) store.set(`daily:${activeKid}:${date}`, next).catch(() => {});
+      return next;
+    });
+  }, [activeKid, date]);
 
   /* ---------- completion emails to parents ----------
      When the child finishes questions / chores, ask the server to email the
@@ -1308,6 +1419,21 @@ export default function App() {
 
   const banner = updateReady ? <UpdateBanner onUpdate={applyUpdate} /> : null;
 
+  // Co-parent invite link active: show the auth screen pre-filled to join this
+  // family, even if someone is already logged in (they can switch accounts).
+  if (inviteCode) {
+    if (!adminInitialized)
+      return <AdminInitScreen setupProtected={setupProtected} onAuthed={handleAuthed} updateBanner={banner} />;
+    return (
+      <AuthScreen
+        onAuthed={handleAuthed}
+        updateBanner={banner}
+        inviteCode={inviteCode}
+        onCancelInvite={() => setInviteCode("")}
+      />
+    );
+  }
+
   // Signed out AND no kid-mode link active -> first-run admin setup or login/signup.
   if (!parent && !familyMode) {
     if (!adminInitialized)
@@ -1336,6 +1462,7 @@ export default function App() {
       <Header
         parent={parent}
         familyMode={familyMode}
+        familyName={familyName}
         kids={kids}
         activeKid={activeKid}
         setActiveKid={setActiveKid}
@@ -1354,20 +1481,53 @@ export default function App() {
           activeKid={activeKid}
           setActiveKid={setActiveKid}
           date={date}
+          unlocked={parentUnlocked}
+          setUnlocked={setParentUnlocked}
+          onExitParent={() => setParentMode(false)}
+          onRenamed={setFamilyName}
         />
       ) : !kid ? (
         <EmptyState onParent={() => setParentMode(true)} familyMode={familyMode} />
       ) : (
         <>
           <TabBar tab={tab} setTab={setTab} />
-          {rewardEarned && (
-            <div className="sq-noprint sq-update" style={{ position: "static", transform: "none", width: "auto", marginBottom: 16, background: "linear-gradient(135deg,#2fa84f,#1f9d6d)" }}>
-              <span className="sq-update-emoji" aria-hidden="true">🎉</span>
+          {showRibbon && (
+            <div
+              className="sq-noprint"
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 12,
+                maxWidth: 560,
+                margin: "0 auto 16px",
+                padding: "12px 16px",
+                borderRadius: 14,
+                color: "#fff",
+                background: "linear-gradient(135deg,#2fa84f,#1f9d6d)",
+                boxShadow: "0 6px 18px rgba(47,168,79,.25)",
+              }}
+            >
+              <span className="sq-bob" style={{ fontSize: 24 }} aria-hidden="true">🎉</span>
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div style={{ fontWeight: 800, fontFamily: FONT_DISPLAY }}>All done — you earned a game!</div>
-                <div style={{ fontSize: 13, opacity: 0.9 }}>Everything correct and all chores finished. Nice!</div>
+                <div style={{ fontSize: 13, opacity: 0.92 }}>
+                  {REWARD_MAX_PLAYS - rewardPlays} play{REWARD_MAX_PLAYS - rewardPlays === 1 ? "" : "s"} left today
+                </div>
               </div>
-              <button className="sq-update-btn" onClick={() => setShowReward(true)}>Play 🎮</button>
+              <button
+                onClick={() => setShowReward(true)}
+                style={{ flexShrink: 0, padding: "9px 16px", borderRadius: 10, border: "none", background: "#fff", color: "#1f9d6d", fontWeight: 800, fontSize: 14, cursor: "pointer", fontFamily: FONT_DISPLAY }}
+              >
+                Play 🎮
+              </button>
+              <button
+                onClick={() => setRewardDismissed(true)}
+                aria-label="Close"
+                title="Close"
+                style={{ flexShrink: 0, width: 30, height: 30, borderRadius: 8, border: "none", background: "rgba(255,255,255,.25)", color: "#fff", fontWeight: 800, fontSize: 16, cursor: "pointer", lineHeight: 1 }}
+              >
+                ✕
+              </button>
             </div>
           )}
           {tab === "study" && <StudyView kid={kid} day={day} saveDay={saveDay} dayLoading={dayLoading} />}
@@ -1375,13 +1535,13 @@ export default function App() {
             <ChoresView chores={chores} choreLog={choreLog} saveChoreLog={saveChoreLog} />
           )}
           {tab === "calendar" && (
-            <CalendarView kid={kid} mode={calMode} setMode={setCalMode} date={date} />
+            <CalendarView kid={kid} date={date} />
           )}
         </>
       )}
 
       {showReward && kid && (
-        <RewardGameModal grade={kid.grade} kidName={kid.name} onClose={() => setShowReward(false)} />
+        <RewardGameModal grade={kid.grade} kidName={kid.name} onClose={finishReward} />
       )}
 
       {choreCeleb && !showReward && (
@@ -1400,13 +1560,15 @@ export default function App() {
 }
 
 /* ============================ AUTH SCREEN ============================ */
-function AuthScreen({ onAuthed, updateBanner }) {
-  const [mode, setMode] = useState("login"); // login | signup
+function AuthScreen({ onAuthed, updateBanner, inviteCode = "", onCancelInvite }) {
+  const hasInvite = !!inviteCode;
+  const [mode, setMode] = useState(hasInvite ? "signup" : "login"); // invitees usually need an account
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
-  const [joinFamily, setJoinFamily] = useState(false);
-  const [familyCode, setFamilyCode] = useState("");
+  const [joinFamily, setJoinFamily] = useState(hasInvite);
+  const [familyCode, setFamilyCode] = useState(inviteCode || "");
+  const [familyName, setFamilyName] = useState("");
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
   const [pending, setPending] = useState(null); // {email, devLink?, emailConfigured} after signup
@@ -1414,22 +1576,45 @@ function AuthScreen({ onAuthed, updateBanner }) {
   const [resendMsg, setResendMsg] = useState("");
 
   const isEmailish = (v) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v.trim());
+  const isAdminLogin = (v) => v.trim().toLowerCase() === "admin";
 
   const submit = async () => {
     setErr("");
     setNeedsVerify(false);
-    if (!isEmailish(email)) return setErr("Enter a valid email address.");
+    // Signup must be a real email. Login also allows the reserved "admin" account.
+    if (mode === "signup" && !isEmailish(email)) return setErr("Enter a valid email address.");
+    if (mode === "login" && !isEmailish(email) && !isAdminLogin(email)) return setErr("Enter a valid email address.");
     if (password.length < 6) return setErr("Password must be at least 6 characters.");
     if (mode === "signup" && password !== confirm) return setErr("Passwords don't match.");
     if (mode === "signup" && joinFamily && !familyCode.trim()) return setErr("Enter the family code, or uncheck the box to start a new family.");
     setBusy(true);
     try {
       if (mode === "signup") {
-        const r = await api.signup(email.trim(), password, joinFamily ? familyCode.trim() : "");
+        const r = await api.signup(email.trim(), password, joinFamily ? familyCode.trim() : "", joinFamily ? "" : familyName.trim());
         setPending({ email: email.trim(), devLink: r.devLink, emailConfigured: r.emailConfigured !== false });
         setBusy(false);
       } else {
         const parentObj = await api.login(email.trim(), password);
+        // If they followed an invite link, join that family right after logging in.
+        if (hasInvite) {
+          try {
+            const prev = await api.familyJoinPreview(inviteCode);
+            if (prev && !prev.alreadyMember && prev.willDeleteOld && prev.kidsLost > 0) {
+              const cur = prev.currentName ? `"${prev.currentName}"` : "your current family";
+              const proceed = window.confirm(
+                `Heads up: joining ${prev.targetName ? `"${prev.targetName}"` : "this family"} will remove you from ${cur} and permanently delete it, including its ${prev.kidsLost} child${prev.kidsLost === 1 ? "" : "ren"} and all their saved questions and chores.\n\nThis can't be undone. Continue?`
+              );
+              if (!proceed) {
+                // stay logged in to their existing family
+                await onAuthed(parentObj);
+                return;
+              }
+            }
+            await api.familyJoin(inviteCode);
+          } catch (e) {
+            // joining failed (e.g. invite expired) — continue logged in to their own family
+          }
+        }
         await onAuthed(parentObj);
       }
     } catch (e) {
@@ -1499,21 +1684,32 @@ function AuthScreen({ onAuthed, updateBanner }) {
       <div className="sq-card" style={{ ...panel, maxWidth: 440, width: "100%" }}>
         <div style={{ fontSize: 40, textAlign: "center" }}>🎓</div>
         <h1 className="sq-h" style={{ ...h1, textAlign: "center", marginTop: 4 }}>
-          {mode === "signup" ? "Create a parent account" : "Welcome back"}
+          {hasInvite ? "Join your family on StudyQuest" : mode === "signup" ? "Create a parent account" : "Welcome back"}
         </h1>
+        {hasInvite && (
+          <div style={{ background: "#eef2fb", border: "1px solid #d3def5", borderRadius: 12, padding: "10px 12px", margin: "0 0 6px", fontSize: 14, color: "#3b5b8e", textAlign: "center" }}>
+            You've been invited to help manage your family's kids. {mode === "signup" ? "Create an account" : "Log in"} and you'll join automatically.{" "}
+            <button
+              onClick={() => setMode(mode === "signup" ? "login" : "signup")}
+              style={{ background: "none", border: "none", color: "#3b7de8", fontWeight: 800, cursor: "pointer", fontFamily: FONT_DISPLAY, fontSize: 14, padding: 0 }}
+            >
+              {mode === "signup" ? "Already have an account? Log in" : "Need an account? Sign up"}
+            </button>
+          </div>
+        )}
         <p style={{ color: "#7a6f8c", textAlign: "center", marginTop: -6 }}>
           {mode === "signup"
             ? "Sign up with your email — we'll send a quick verification link."
             : "Log in to see your kids and their progress."}
         </p>
 
-        <label style={lbl}>Email address</label>
+        <label style={lbl}>{mode === "login" ? "Email address" : "Email address"}</label>
         <input
           style={input}
-          type="email"
+          type={mode === "login" ? "text" : "email"}
           value={email}
           onChange={(e) => setEmail(e.target.value)}
-          placeholder="you@example.com"
+          placeholder={mode === "login" ? "you@example.com" : "you@example.com"}
           autoCapitalize="none"
           autoCorrect="off"
           onKeyDown={(e) => mode === "login" && e.key === "Enter" && submit()}
@@ -1538,11 +1734,27 @@ function AuthScreen({ onAuthed, updateBanner }) {
               placeholder="Re-enter password"
               onKeyDown={(e) => !joinFamily && e.key === "Enter" && submit()}
             />
-            <label style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 14, color: "#6a5f7e", fontWeight: 700, fontSize: 14, cursor: "pointer" }}>
-              <input type="checkbox" checked={joinFamily} onChange={(e) => setJoinFamily(e.target.checked)} style={{ width: 18, height: 18 }} />
-              Join an existing family (a co-parent shared a code)
+            {!joinFamily && (
+              <>
+                <label style={lbl}>Family name <span style={{ color: "#9a8fb0", fontWeight: 600 }}>(optional)</span></label>
+                <input
+                  style={input}
+                  value={familyName}
+                  onChange={(e) => setFamilyName(e.target.value)}
+                  placeholder="e.g. The Smith Family"
+                  maxLength={40}
+                  onKeyDown={(e) => e.key === "Enter" && submit()}
+                />
+                <div style={{ fontSize: 12, color: "#9a8fb0", marginTop: 4 }}>
+                  Shown at the top of the app. You can change it later in the Parent area.
+                </div>
+              </>
+            )}
+            <label style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 14, color: "#6a5f7e", fontWeight: 700, fontSize: 14, cursor: hasInvite ? "default" : "pointer" }}>
+              <input type="checkbox" checked={joinFamily} onChange={(e) => !hasInvite && setJoinFamily(e.target.checked)} disabled={hasInvite} style={{ width: 18, height: 18 }} />
+              {hasInvite ? "Joining your family (from your invite link)" : "Join an existing family (a co-parent shared a code)"}
             </label>
-            {joinFamily && (
+            {joinFamily && !hasInvite && (
               <>
                 <input
                   style={{ ...input, marginTop: 8, letterSpacing: ".1em", textTransform: "uppercase" }}
@@ -1586,6 +1798,16 @@ function AuthScreen({ onAuthed, updateBanner }) {
             {mode === "signup" ? "Log in" : "Create one"}
           </button>
         </div>
+        {hasInvite && onCancelInvite && (
+          <div style={{ textAlign: "center", marginTop: 8 }}>
+            <button
+              onClick={onCancelInvite}
+              style={{ background: "none", border: "none", color: "#9a8fb0", fontWeight: 700, cursor: "pointer", fontFamily: FONT_DISPLAY, fontSize: 13 }}
+            >
+              Cancel invitation
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -1646,7 +1868,7 @@ function ParentLoginScreen({ onAuthed, onCancel, updateBanner }) {
           Log in to manage kids, chores, and settings.
         </p>
         <label style={lbl}>Email address</label>
-        <input style={input} type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com" autoCapitalize="none" autoCorrect="off" />
+        <input style={input} type="text" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com" autoCapitalize="none" autoCorrect="off" />
         <label style={lbl}>Password</label>
         <input style={input} type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Your password" onKeyDown={(e) => e.key === "Enter" && submit()} />
         {err && <div style={errBox}>{err}</div>}
@@ -1721,12 +1943,19 @@ function AdminInitScreen({ setupProtected, onAuthed, updateBanner }) {
 }
 
 /* =============================== HEADER ============================== */
-function Header({ parent, familyMode, kids, activeKid, setActiveKid, parentMode, onParent, onExitParent, onLogout }) {
+function Header({ parent, familyMode, familyName, kids, activeKid, setActiveKid, parentMode, onParent, onExitParent, onLogout }) {
   const displayName = parent ? (parent.isAdmin ? "admin" : parent.email) : null;
   return (
     <header className="sq-noprint" style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", marginBottom: 18 }}>
-      <div className="sq-h" style={{ fontSize: 26, fontWeight: 700, color: "#4a3f5e", display: "flex", alignItems: "center", gap: 8 }}>
-        <span style={{ fontSize: 28 }}>🎓</span> StudyQuest
+      <div style={{ display: "flex", flexDirection: "column", lineHeight: 1.15 }}>
+        <div className="sq-h" style={{ fontSize: 26, fontWeight: 700, color: "#4a3f5e", display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ fontSize: 28 }}>🎓</span> StudyQuest
+        </div>
+        {familyName ? (
+          <div className="sq-h" style={{ fontSize: 14, fontWeight: 700, color: "#9b4dca", marginLeft: 36, marginTop: 1 }}>
+            {familyName}
+          </div>
+        ) : null}
       </div>
       <div style={{ flex: 1 }} />
       {!parentMode && kids.length > 0 && (
@@ -2198,6 +2427,18 @@ function StudyView({ kid, day, saveDay, dayLoading }) {
   const [banner, setBanner] = useState(null); // {subject, type, text}
   const [now, setNow] = useState(Date.now()); // live clock for countdowns
   const [aced, setAced] = useState(null); // celebration popup payload {index, headline}
+
+  // If the open subject has no questions today (parent set it to 0), switch to
+  // the first subject that does.
+  useEffect(() => {
+    if (!day) return;
+    const hasQ = (k) => Array.isArray(day[k]) && day[k].length > 0;
+    if (!hasQ(openSubject)) {
+      const first = SUBJECTS.find((s) => hasQ(s.key));
+      if (first && first.key !== openSubject) setOpenSubject(first.key);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [day, openSubject]);
   const [celebrate, setCelebrate] = useState({}); // `${subject}:${i}` -> true (newly correct)
   const [helpLoading, setHelpLoading] = useState({}); // `${subject}:${i}` -> true while fetching help
   const lastCelebRef = useRef(-1); // last celebration shown, so we vary them
@@ -2397,7 +2638,7 @@ function StudyView({ kid, day, saveDay, dayLoading }) {
 
       {/* subject tabs */}
       <div className="sq-noprint" style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 16 }}>
-        {SUBJECTS.map((s) => {
+        {SUBJECTS.filter((s) => Array.isArray(day[s.key]) && day[s.key].length > 0).map((s) => {
           const sc = subjectScore(s.key);
           const active = openSubject === s.key;
           return (
@@ -2419,8 +2660,16 @@ function StudyView({ kid, day, saveDay, dayLoading }) {
 
       {/* active subject card */}
       {(() => {
+        const available = SUBJECTS.filter((x) => Array.isArray(day[x.key]) && day[x.key].length > 0).map((x) => x.key);
+        if (available.length === 0) {
+          return (
+            <div className="sq-card" style={panel}>
+              <p style={{ color: "#7a6f8c", margin: 0 }}>No questions are set for today. A parent can adjust how many questions each subject has in the Parent area.</p>
+            </div>
+          );
+        }
         const s = subjMeta(openSubject);
-        const list = day[openSubject];
+        const list = day[openSubject] || [];
         const sc = subjectScore(openSubject);
         return (
           <div className="sq-card" style={{ ...panel, borderTop: `5px solid ${s.color}` }}>
@@ -2710,45 +2959,59 @@ function Segmented({ value, options, onChange }) {
 }
 
 /* =========================== CALENDAR VIEW =========================== */
-function CalendarView({ kid, mode, setMode, date }) {
+function CalendarView({ kid, date }) {
   const [cursor, setCursor] = useState(() => {
     const d = new Date();
     return { y: d.getFullYear(), m: d.getMonth() };
   });
-  const [data, setData] = useState({}); // dateKey -> summary
+  const [data, setData] = useState({}); // dateKey -> { q?, ch? }
+  const [loading, setLoading] = useState(false);
 
   useEffect(() => {
+    let cancelled = false;
     (async () => {
+      setLoading(true);
       const days = daysInMonth(cursor.y, cursor.m);
       const map = {};
       for (let dn = 1; dn <= days; dn++) {
         const key = `${cursor.y}-${String(cursor.m + 1).padStart(2, "0")}-${String(dn).padStart(2, "0")}`;
-        if (mode === "study") {
-          const d = await store.get(`daily:${kid.id}:${key}`);
-          if (d) {
-            let right = 0, total = 0, checked = 0;
-            for (const subj of SUBJECTS.map((s) => s.key)) {
-              (d[subj] || []).forEach((it) => {
-                total++;
-                if (it.checked) checked++;
-                if (it.correct === true) right++;
-              });
-            }
-            map[key] = { right, total, checked };
+
+        // Questions
+        const d = await store.get(`daily:${kid.id}:${key}`);
+        if (d) {
+          let right = 0, total = 0, checked = 0;
+          for (const subj of SUBJECTS.map((s) => s.key)) {
+            const list = Array.isArray(d[subj]) ? d[subj] : [];
+            list.forEach((it) => {
+              total++;
+              if (it.checked) checked++;
+              if (it.correct === true) right++;
+            });
           }
-        } else {
-          const log = await store.get(`chore-log:${kid.id}:${key}`);
-          if (log) {
-            const vals = Object.values(log);
-            const done = vals.filter((v) => v.completed === "yes").length;
-            const partly = vals.filter((v) => v.completed === "partly").length;
-            map[key] = { done, partly, count: vals.length };
+          if (total > 0) map[key] = { ...(map[key] || {}), q: { right, total, checked } };
+        }
+
+        // Chores (only count chores that were actually scheduled/answered that day)
+        const log = await store.get(`chore-log:${kid.id}:${key}`);
+        if (log && typeof log === "object") {
+          const vals = Object.values(log);
+          const count = vals.length;
+          if (count > 0) {
+            const done = vals.filter((v) => v && v.completed === "yes").length;
+            const partly = vals.filter((v) => v && v.completed === "partly").length;
+            map[key] = { ...(map[key] || {}), ch: { done, partly, count } };
           }
         }
       }
-      setData(map);
+      if (!cancelled) {
+        setData(map);
+        setLoading(false);
+      }
     })();
-  }, [cursor, mode, kid.id]);
+    return () => {
+      cancelled = true;
+    };
+  }, [cursor, kid.id]);
 
   const days = daysInMonth(cursor.y, cursor.m);
   const firstDow = new Date(cursor.y, cursor.m, 1).getDay();
@@ -2761,14 +3024,16 @@ function CalendarView({ kid, mode, setMode, date }) {
     setCursor({ y, m });
   };
 
+  const scoreColor = (right, total) => {
+    const pct = total ? right / total : 0;
+    return pct >= 0.8 ? "#2f7a45" : pct >= 0.5 ? "#b8702a" : "#c0455c";
+  };
+
   return (
     <div>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, marginBottom: 14 }}>
         <h2 className="sq-h" style={{ ...h2, margin: 0 }}>{kid.name}'s Progress</h2>
-        <div style={{ display: "flex", gap: 8 }}>
-          <button style={{ ...chip, background: mode === "study" ? "#4a3f5e" : "#fff", color: mode === "study" ? "#fff" : "#4a3f5e" }} onClick={() => setMode("study")}>📚 Questions</button>
-          <button style={{ ...chip, background: mode === "chores" ? "#4a3f5e" : "#fff", color: mode === "chores" ? "#fff" : "#4a3f5e" }} onClick={() => setMode("chores")}>🧹 Chores</button>
-        </div>
+        <div style={{ fontSize: 13, color: "#9a8fb0", fontWeight: 700 }}>📚 Questions &nbsp;·&nbsp; 🧹 Chores</div>
       </div>
 
       <div className="sq-card" style={panel}>
@@ -2786,37 +3051,40 @@ function CalendarView({ kid, mode, setMode, date }) {
           {Array.from({ length: days }).map((_, i) => {
             const dn = i + 1;
             const key = `${cursor.y}-${String(cursor.m + 1).padStart(2, "0")}-${String(dn).padStart(2, "0")}`;
-            const info = data[key];
+            const info = data[key] || {};
+            const q = info.q;
+            const ch = info.ch;
             const isToday = key === date;
-            let bg = "#f6f3fb", label = "", ring = isToday ? "2px solid #4a3f5e" : "1px solid #ece7f3";
-            if (info) {
-              if (mode === "study" && info.checked > 0) {
-                const pct = info.total ? info.right / info.total : 0;
-                bg = pct >= 0.8 ? "#cdeccf" : pct >= 0.5 ? "#fdebc0" : "#f8d4da";
-                label = `${info.right}/${info.total}`;
-              } else if (mode === "study") {
-                bg = "#e7e1f1"; label = "•";
-              } else if (mode === "chores") {
-                const pct = info.count ? info.done / info.count : 0;
-                bg = pct >= 0.8 ? "#cdeccf" : pct >= 0.4 ? "#fdebc0" : "#f8d4da";
-                label = `${info.done}/${info.count}`;
-              }
-            }
+            const ring = isToday ? "2px solid #4a3f5e" : "1px solid #ece7f3";
+
             return (
-              <div key={key} style={{ aspectRatio: "1", borderRadius: 12, background: bg, border: ring, padding: 6, display: "flex", flexDirection: "column", justifyContent: "space-between" }}>
+              <div key={key} style={{ minHeight: 62, borderRadius: 12, background: "#faf8fd", border: ring, padding: 5, display: "flex", flexDirection: "column", gap: 2 }}>
                 <div style={{ fontSize: 12, fontWeight: 700, color: "#6a5f7e" }}>{dn}</div>
-                {label && <div style={{ fontSize: 13, fontWeight: 800, textAlign: "center", color: "#3b3350" }}>{label}</div>}
+                {q && q.checked > 0 && (
+                  <div style={{ fontSize: 12, fontWeight: 800, color: scoreColor(q.right, q.total) }}>
+                    📚 {q.right}/{q.total}
+                  </div>
+                )}
+                {q && q.checked === 0 && (
+                  <div style={{ fontSize: 11, fontWeight: 700, color: "#9a8fb0" }}>📚 •</div>
+                )}
+                {ch && (
+                  <div style={{ fontSize: 12, fontWeight: 800, color: scoreColor(ch.done, ch.count) }}>
+                    🧹 {ch.done}/{ch.count}
+                  </div>
+                )}
               </div>
             );
           })}
         </div>
 
         <div style={{ display: "flex", gap: 16, marginTop: 16, flexWrap: "wrap", fontSize: 13, color: "#7a6f8c" }}>
-          <Legend c="#cdeccf" t="Great (80%+)" />
-          <Legend c="#fdebc0" t="Okay (mid)" />
-          <Legend c="#f8d4da" t="Needs work" />
-          <Legend c="#e7e1f1" t="Started" />
+          <Legend c="#2f7a45" t="Great (80%+)" />
+          <Legend c="#b8702a" t="Okay" />
+          <Legend c="#c0455c" t="Needs work" />
+          <span style={{ color: "#9a8fb0" }}>📚 = questions · 🧹 = chores</span>
         </div>
+        {loading && <div style={{ marginTop: 10, color: "#9a8fb0", fontSize: 13 }}>Loading…</div>}
       </div>
     </div>
   );
@@ -2833,8 +3101,7 @@ function Legend({ c, t }) {
 const daysInMonth = (y, m) => new Date(y, m + 1, 0).getDate();
 
 /* ============================ PARENT PANEL ============================ */
-function ParentPanel({ parent, setParent, kids, refreshKids, activeKid, setActiveKid, date }) {
-  const [unlocked, setUnlocked] = useState(false);
+function ParentPanel({ parent, setParent, kids, refreshKids, activeKid, setActiveKid, date, unlocked, setUnlocked, onExitParent, onRenamed }) {
   const [pw, setPw] = useState("");
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
@@ -2859,13 +3126,20 @@ function ParentPanel({ parent, setParent, kids, refreshKids, activeKid, setActiv
         <div style={{ fontSize: 34, textAlign: "center" }}>🔒</div>
         <h2 className="sq-h" style={{ ...h2, textAlign: "center" }}>Parent Area</h2>
         <p style={{ color: "#7a6f8c", textAlign: "center", marginTop: -6 }}>
-          Re-enter your account password to manage kids and view answer keys.
+          Enter your account password once to manage kids and view answer keys. You won't be asked again until you lock it or sign out.
         </p>
-        <input style={input} type="password" value={pw} onChange={(e) => setPw(e.target.value)} placeholder="Account password" onKeyDown={(e) => e.key === "Enter" && tryUnlock()} />
+        <input style={input} type="password" value={pw} onChange={(e) => setPw(e.target.value)} placeholder="Account password" onKeyDown={(e) => e.key === "Enter" && tryUnlock()} autoFocus />
         {err && <div style={errBox}>{err}</div>}
         <button style={{ ...btnPrimary, opacity: busy ? 0.6 : 1 }} disabled={busy} onClick={tryUnlock}>
           {busy ? "Checking…" : "Unlock"}
         </button>
+        {onExitParent && (
+          <div style={{ textAlign: "center", marginTop: 12 }}>
+            <button onClick={onExitParent} style={{ background: "none", border: "none", color: "#7a6f8c", fontWeight: 700, cursor: "pointer", fontFamily: FONT_DISPLAY, fontSize: 14 }}>
+              ← Back to kid view
+            </button>
+          </div>
+        )}
       </div>
     );
   }
@@ -2877,11 +3151,26 @@ function ParentPanel({ parent, setParent, kids, refreshKids, activeKid, setActiv
     ["answers", "🔑 Answer Keys"],
     ["family", "👨‍👩‍👧 Family"],
     ["account", "⚙️ Account"],
-    ...(parent && parent.isAdmin ? [["admin", "🛡️ Admin"]] : []),
+    ...(parent && parent.isAdmin ? [["admin", "🛡️ Admin"], ["logs", "📋 Logs"]] : []),
   ];
 
   return (
     <div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, flexWrap: "wrap", marginBottom: 14 }}>
+        <h2 className="sq-h" style={{ ...h2, margin: 0 }}>⚙️ Parent Area</h2>
+        <div style={{ display: "flex", gap: 8 }}>
+          {onExitParent && (
+            <button style={btnGhost} onClick={onExitParent}>← Exit parent mode</button>
+          )}
+          <button
+            style={{ ...btnGhost, borderColor: "#e0506b", color: "#e0506b" }}
+            onClick={() => { setUnlocked(false); if (onExitParent) onExitParent(); }}
+            title="Lock the parent area (will ask for your password next time)"
+          >
+            🔒 Lock
+          </button>
+        </div>
+      </div>
       <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 16 }}>
         {sections.map(([k, l]) => (
           <button key={k} onClick={() => setSection(k)} style={{ ...chip, background: section === k ? "#4a3f5e" : "#fff", color: section === k ? "#fff" : "#4a3f5e", borderColor: section === k ? "#4a3f5e" : "#e3dcec" }}>{l}</button>
@@ -2892,34 +3181,58 @@ function ParentPanel({ parent, setParent, kids, refreshKids, activeKid, setActiv
       {section === "categories" && <CategoriesManager kids={kids} refreshKids={refreshKids} activeKid={activeKid} setActiveKid={setActiveKid} />}
       {section === "chores" && <ChoresManager kids={kids} activeKid={activeKid} setActiveKid={setActiveKid} />}
       {section === "answers" && <AnswerKey kids={kids} date={date} />}
-      {section === "family" && <FamilyManager />}
+      {section === "family" && <FamilyManager onRenamed={onRenamed} />}
       {section === "account" && <AccountManager parent={parent} setParent={setParent} />}
       {section === "admin" && parent && parent.isAdmin && <AdminPanel meUsername={parent.username} />}
+      {section === "logs" && parent && parent.isAdmin && <LogViewer />}
     </div>
   );
 }
 
 /* ------------------------------ family manager -------------------------- */
-function FamilyManager() {
-  const [info, setInfo] = useState(null); // { code, members }
+function FamilyManager({ onRenamed }) {
+  const [info, setInfo] = useState(null); // { code, name, members }
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
   const [copied, setCopied] = useState("");
+  const [nameInput, setNameInput] = useState("");
+  const [nameSaved, setNameSaved] = useState(false);
+  const [nameBusy, setNameBusy] = useState(false);
 
   const load = async () => {
     setErr("");
     try {
-      setInfo(await api.familyInfo());
+      const i = await api.familyInfo();
+      setInfo(i);
+      setNameInput((i && i.name) || "");
     } catch (e) {
       setErr(e.message || "Could not load family info.");
-      setInfo({ code: "", members: [] });
+      setInfo({ code: "", name: "", members: [] });
     }
   };
   useEffect(() => {
     load();
   }, []);
 
+  const saveName = async () => {
+    setNameSaved(false);
+    setNameBusy(true);
+    try {
+      const r = await api.familyRename(nameInput.trim());
+      const newName = (r && r.name) || "";
+      setInfo((i) => ({ ...(i || { members: [] }), name: newName }));
+      setNameInput(newName);
+      setNameSaved(true);
+      if (onRenamed) onRenamed(newName); // update the header live
+    } catch (e) {
+      setErr(e.message || "Could not save the family name.");
+    } finally {
+      setNameBusy(false);
+    }
+  };
+
   const kidsLink = info && info.code ? `${window.location.origin}/?family=${info.code}` : "";
+  const inviteLink = info && info.code ? `${window.location.origin}/?invite=${info.code}` : "";
 
   const copy = async (text, which) => {
     if (!text) return;
@@ -2930,6 +3243,25 @@ function FamilyManager() {
     } catch {
       /* clipboard may be unavailable; values are shown on screen anyway */
     }
+  };
+
+  // Native share sheet (mobile) with clipboard fallback.
+  const shareInvite = async () => {
+    if (!inviteLink) return;
+    const shareData = {
+      title: "Join our StudyQuest family",
+      text: "You're invited to help manage our kids on StudyQuest. Open this link to log in or create your account — you'll join our family automatically:",
+      url: inviteLink,
+    };
+    if (navigator.share) {
+      try {
+        await navigator.share(shareData);
+        return;
+      } catch {
+        /* user cancelled or share failed — fall back to copy */
+      }
+    }
+    copy(inviteLink, "invite");
   };
 
   const regen = async () => {
@@ -2953,6 +3285,26 @@ function FamilyManager() {
       </p>
       {err && <div style={errBox}>{err}</div>}
 
+      {/* Family name */}
+      <div style={{ marginBottom: 16 }}>
+        <div style={lbl}>🏷️ Family name</div>
+        <p style={{ fontSize: 13, color: "#7a6f8c", margin: "0 0 8px" }}>Shown at the top of the app for everyone in your family.</p>
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <input
+            style={{ ...input, margin: 0, maxWidth: 280 }}
+            value={nameInput}
+            onChange={(e) => { setNameInput(e.target.value); setNameSaved(false); }}
+            placeholder="e.g. The Smith Family"
+            maxLength={40}
+            onKeyDown={(e) => e.key === "Enter" && saveName()}
+          />
+          <button style={{ ...btnPrimary, marginTop: 0, opacity: nameBusy ? 0.6 : 1 }} disabled={nameBusy} onClick={saveName}>
+            {nameBusy ? "Saving…" : "Save name"}
+          </button>
+          {nameSaved && <span style={{ color: "#2fa84f", fontWeight: 700, fontSize: 14 }}>✓ Saved</span>}
+        </div>
+      </div>
+
       {/* Kids' no-login link */}
       <div style={{ marginTop: 6, padding: 14, background: "#eef7f0", borderRadius: 14, border: "1px solid #cdeccf" }}>
         <div style={{ ...lbl, marginTop: 0, color: "#2f7a45" }}>🧒 Kids' access link (no password needed)</div>
@@ -2970,23 +3322,32 @@ function FamilyManager() {
         </div>
       </div>
 
-      {/* Co-parent invite code */}
-      <div style={{ marginTop: 18 }}>
-        <div style={lbl}>👨‍👩‍👧 Co-parent invite code</div>
-        <p style={{ fontSize: 13, color: "#7a6f8c", margin: "0 0 8px" }}>
-          To give another parent their own login (with email + password), share this code. They sign up and pick
-          "Join an existing family."
+      {/* Co-parent invite link */}
+      <div style={{ marginTop: 18, padding: 14, background: "#eef2fb", borderRadius: 14, border: "1px solid #d3def5" }}>
+        <div style={{ ...lbl, marginTop: 0, color: "#3b5b8e" }}>👨‍👩‍👧 Invite another parent</div>
+        <p style={{ fontSize: 13, color: "#52688e", margin: "0 0 10px" }}>
+          Send this link to another parent. When they open it, they can log in or create an account and they'll
+          join your family automatically — no code to type.
         </p>
         <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-          <code style={{ fontSize: 20, fontWeight: 800, letterSpacing: ".08em", background: "#f6f3fb", padding: "10px 16px", borderRadius: 12, color: "#4a3f5e", fontFamily: FONT_DISPLAY }}>
-            {info ? info.code || "—" : "…"}
-          </code>
-          <button style={btnGhost} onClick={() => copy(info && info.code, "code")} disabled={!info || !info.code}>{copied === "code" ? "✓ Copied" : "📋 Copy"}</button>
-          <button style={{ ...btnGhost, borderColor: "#e0506b", color: "#e0506b" }} onClick={regen} disabled={busy}>
-            {busy ? "…" : "↻ New code"}
+          <button style={{ ...btnPrimary, marginTop: 0, background: "#3b7de8" }} onClick={shareInvite} disabled={!inviteLink}>
+            {copied === "invite" ? "✓ Link copied" : "📤 Share invite link"}
+          </button>
+          <button style={{ ...btnGhost, borderColor: "#3b7de8", color: "#3b5b8e" }} onClick={() => copy(inviteLink, "invite2")} disabled={!inviteLink}>
+            {copied === "invite2" ? "✓ Copied" : "📋 Copy link"}
           </button>
         </div>
-        <div style={{ fontSize: 12, color: "#9a8fb0", marginTop: 6 }}>Treat the code and link like a password — only share with people who should see your kids. Making a new code revokes the old link too.</div>
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", marginTop: 10 }}>
+          <code style={{ flex: 1, minWidth: 200, fontSize: 13, background: "#fff", padding: "10px 12px", borderRadius: 10, color: "#3b5b8e", wordBreak: "break-all", border: "1px solid #d3def5" }}>
+            {inviteLink || "…"}
+          </code>
+        </div>
+        <div style={{ fontSize: 12, color: "#9aa6bd", marginTop: 8 }}>
+          Prefer to share a code instead? The family code is <strong>{info ? info.code || "—" : "…"}</strong>{" "}
+          <button onClick={() => copy(info && info.code, "code")} disabled={!info || !info.code} style={{ ...miniLink, marginLeft: 4 }}>{copied === "code" ? "✓ copied" : "copy"}</button>.
+          <button onClick={regen} disabled={busy} style={{ ...miniLink, marginLeft: 8, color: "#e0506b" }}>{busy ? "…" : "↻ new code (revokes old link)"}</button>
+        </div>
+        <div style={{ fontSize: 12, color: "#9aa6bd", marginTop: 6 }}>Treat the link like a password — only share it with people who should see your kids.</div>
       </div>
 
       <h3 className="sq-h" style={{ fontSize: 18, marginTop: 22, marginBottom: 8 }}>Parents in this family</h3>
@@ -3206,32 +3567,229 @@ function AdminPanel({ meUsername }) {
   );
 }
 
+/* ----------------------------- log viewer ------------------------------ */
+const LOG_LEVEL_META = {
+  error: { color: "#c0455c", bg: "#fdecef", label: "ERROR" },
+  warn: { color: "#b8702a", bg: "#fdf3e7", label: "WARN" },
+  info: { color: "#3b5b8e", bg: "#eef2fb", label: "INFO" },
+  verbose: { color: "#2f7a45", bg: "#eef7f0", label: "VERBOSE" },
+  debug: { color: "#6a5f7e", bg: "#f3eefb", label: "DEBUG" },
+};
+
+function LogViewer() {
+  const todayKeyLocal = () => {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  };
+  const [level, setLevel] = useState("debug"); // include this and more severe
+  const [from, setFrom] = useState("");
+  const [to, setTo] = useState("");
+  const [username, setUsername] = useState("");
+  const [family, setFamily] = useState("");
+  const [text, setText] = useState("");
+  const [entries, setEntries] = useState(null);
+  const [meta, setMeta] = useState({ scanned: 0, activeLevel: "" });
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const [expanded, setExpanded] = useState({}); // ts -> bool
+
+  const run = async () => {
+    setBusy(true);
+    setErr("");
+    try {
+      const r = await api.adminLogs({ level, from, to, username, family, text, limit: 300 });
+      setEntries((r && r.entries) || []);
+      setMeta({ scanned: (r && r.scanned) || 0, activeLevel: (r && r.activeLevel) || "" });
+    } catch (e) {
+      setErr(e.message || "Could not load logs.");
+      setEntries([]);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    run();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const clearOld = async () => {
+    const cutoff = prompt("Delete logs OLDER THAN which date? (YYYY-MM-DD). Leave blank and press OK to delete ALL logs.", "");
+    if (cutoff === null) return; // cancelled
+    if (cutoff && !/^\d{4}-\d{2}-\d{2}$/.test(cutoff.trim())) {
+      alert("Please use YYYY-MM-DD format.");
+      return;
+    }
+    if (!cutoff && !confirm("Delete ALL logs? This cannot be undone.")) return;
+    setBusy(true);
+    try {
+      const r = await api.adminLogClear(cutoff.trim() || undefined);
+      alert(`Removed ${r && r.removed != null ? r.removed : 0} log entries.`);
+      await run();
+    } catch (e) {
+      setErr(e.message || "Could not clear logs.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const fmtTime = (iso) => {
+    try {
+      return new Date(iso).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    } catch {
+      return iso;
+    }
+  };
+
+  const setQuick = (days) => {
+    const end = todayKeyLocal();
+    const d = new Date();
+    d.setDate(d.getDate() - days);
+    const start = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+    setFrom(start);
+    setTo(end);
+  };
+
+  return (
+    <div className="sq-card" style={panel}>
+      <h2 className="sq-h" style={{ ...h2, marginTop: 0 }}>📋 Event Logs</h2>
+      <p style={{ color: "#7a6f8c", marginTop: -8 }}>
+        Troubleshoot issues and workflows. Filter by level, date, family, or username. Currently persisting level: <strong>{meta.activeLevel || "info"}</strong> and above.
+      </p>
+
+      {/* Filters */}
+      <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "flex-end", marginBottom: 12 }}>
+        <label style={{ fontSize: 13, color: "#6a5f7e", fontWeight: 700 }}>
+          Level (and worse)
+          <select style={{ ...input, margin: "4px 0 0", maxWidth: 150 }} value={level} onChange={(e) => setLevel(e.target.value)}>
+            <option value="error">Error</option>
+            <option value="warn">Warn & up</option>
+            <option value="info">Info & up</option>
+            <option value="verbose">Verbose & up</option>
+            <option value="debug">Debug (all)</option>
+          </select>
+        </label>
+        <label style={{ fontSize: 13, color: "#6a5f7e", fontWeight: 700 }}>
+          From
+          <input type="date" style={{ ...input, margin: "4px 0 0", maxWidth: 160 }} value={from} onChange={(e) => setFrom(e.target.value)} />
+        </label>
+        <label style={{ fontSize: 13, color: "#6a5f7e", fontWeight: 700 }}>
+          To
+          <input type="date" style={{ ...input, margin: "4px 0 0", maxWidth: 160 }} value={to} onChange={(e) => setTo(e.target.value)} />
+        </label>
+        <label style={{ fontSize: 13, color: "#6a5f7e", fontWeight: 700 }}>
+          Username / email
+          <input style={{ ...input, margin: "4px 0 0", maxWidth: 200 }} value={username} onChange={(e) => setUsername(e.target.value)} placeholder="contains…" autoCapitalize="none" />
+        </label>
+        <label style={{ fontSize: 13, color: "#6a5f7e", fontWeight: 700 }}>
+          Family (id or name)
+          <input style={{ ...input, margin: "4px 0 0", maxWidth: 180 }} value={family} onChange={(e) => setFamily(e.target.value)} placeholder="contains…" />
+        </label>
+        <label style={{ fontSize: 13, color: "#6a5f7e", fontWeight: 700 }}>
+          Text
+          <input style={{ ...input, margin: "4px 0 0", maxWidth: 180 }} value={text} onChange={(e) => setText(e.target.value)} placeholder="message contains…" />
+        </label>
+      </div>
+
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center", marginBottom: 14 }}>
+        <button style={{ ...btnPrimary, marginTop: 0, opacity: busy ? 0.6 : 1 }} disabled={busy} onClick={run}>{busy ? "Loading…" : "🔍 Search"}</button>
+        <button style={btnGhost} onClick={() => setQuick(0)}>Today</button>
+        <button style={btnGhost} onClick={() => setQuick(7)}>Last 7 days</button>
+        <button style={btnGhost} onClick={() => { setFrom(""); setTo(""); setUsername(""); setFamily(""); setText(""); setLevel("debug"); }}>Clear filters</button>
+        <div style={{ flex: 1 }} />
+        <button style={{ ...btnGhost, borderColor: "#e0506b", color: "#e0506b" }} onClick={clearOld} disabled={busy}>🗑️ Clear logs…</button>
+      </div>
+
+      {err && <div style={errBox}>{err}</div>}
+
+      {entries === null ? (
+        <p style={{ color: "#9a8fb0" }}>Loading…</p>
+      ) : entries.length === 0 ? (
+        <p style={{ color: "#9a8fb0" }}>No log entries match these filters.</p>
+      ) : (
+        <>
+          <div style={{ fontSize: 12, color: "#9a8fb0", marginBottom: 8 }}>
+            Showing {entries.length} {entries.length === 1 ? "entry" : "entries"} (scanned {meta.scanned}). Newest first.
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {entries.map((e, i) => {
+              const m = LOG_LEVEL_META[e.level] || LOG_LEVEL_META.info;
+              const hasDetails = e.details && Object.keys(e.details).length > 0;
+              const key = `${e.ts}-${i}`;
+              const open = expanded[key];
+              return (
+                <div key={key} style={{ border: "1px solid #f0ecf6", borderRadius: 10, padding: "8px 10px", background: "#fff" }}>
+                  <div style={{ display: "flex", gap: 10, alignItems: "baseline", flexWrap: "wrap" }}>
+                    <span style={{ fontSize: 11, fontWeight: 800, color: m.color, background: m.bg, padding: "2px 7px", borderRadius: 6, minWidth: 54, textAlign: "center" }}>{m.label}</span>
+                    <span style={{ fontSize: 12, color: "#9a8fb0", fontFamily: "monospace" }}>{fmtTime(e.iso)}</span>
+                    <span style={{ fontSize: 12, fontWeight: 700, color: "#6a5f7e" }}>{e.event}</span>
+                    <span style={{ flex: 1, minWidth: 120, fontSize: 13, color: "#3b3350", wordBreak: "break-word" }}>{e.message}</span>
+                  </div>
+                  <div style={{ display: "flex", gap: 12, marginTop: 4, flexWrap: "wrap", fontSize: 11, color: "#9a8fb0" }}>
+                    {e.username && <span>👤 {e.username}</span>}
+                    {e.fid && <span>👨‍👩‍👧 {e.fid}</span>}
+                    {e.status != null && <span>HTTP {e.status}</span>}
+                    {e.requestId && <span>req {e.requestId}</span>}
+                    {hasDetails && (
+                      <button onClick={() => setExpanded((x) => ({ ...x, [key]: !open }))} style={{ ...miniLink }}>
+                        {open ? "hide details" : "details"}
+                      </button>
+                    )}
+                  </div>
+                  {open && hasDetails && (
+                    <pre style={{ margin: "8px 0 0", padding: 8, background: "#f6f3fb", borderRadius: 8, fontSize: 11, color: "#4a3f5e", overflow: "auto", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+                      {JSON.stringify(e.details, null, 2)}
+                    </pre>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 /* -------------------------- categories manager -------------------------- */
 function CategoriesManager({ kids, refreshKids, activeKid, setActiveKid }) {
   const kid = kids.find((k) => k.id === activeKid) || kids[0] || null;
 
-  // local editable copy of this kid's category prefs
+  // local editable copy of THIS kid's category prefs
   const [selected, setSelected] = useState({}); // { subject: [names] }
   const [custom, setCustom] = useState({}); // { subject: [names] }
+  const [counts, setCounts] = useState({}); // { subject: number (0-20) }
   const [newCustom, setNewCustom] = useState({}); // { subject: "typing..." }
   const [saved, setSaved] = useState(false);
   const [busy, setBusy] = useState(false);
+  const loadedForRef = useRef(null); // which kid id the local state currently reflects
 
+  // Load a kid's stored prefs into local state. Defaults to everything selected.
+  // Runs only when the SELECTED KID changes (by id), so editing/saving one kid
+  // never disturbs another, and a save doesn't surprise-reset your view.
   useEffect(() => {
+    const id = kid && kid.id;
+    if (!id || loadedForRef.current === id) return;
+    loadedForRef.current = id;
     const cats = (kid && kid.categories) || null;
+    const kidCounts = (kid && kid.counts) || null;
     const sel = {};
     const cus = {};
+    const cnt = {};
     for (const s of SUBJECTS) {
       const builtIn = SUBJECT_CATEGORIES[s.key] || [];
-      cus[s.key] = (cats && cats.custom && cats.custom[s.key]) || [];
+      cus[s.key] = (cats && cats.custom && cats.custom[s.key]) ? cats.custom[s.key].slice() : [];
       const stored = cats && cats.selected && cats.selected[s.key];
-      // default: everything (built-in + any custom) selected
+      // default: everything (built-in + this kid's custom) selected
       sel[s.key] = Array.isArray(stored) ? stored.slice() : [...builtIn, ...cus[s.key]];
+      const c = kidCounts && kidCounts[s.key];
+      cnt[s.key] = Number.isFinite(Number(c)) ? Math.max(0, Math.min(20, Math.round(Number(c)))) : 10;
     }
     setSelected(sel);
     setCustom(cus);
+    setCounts(cnt);
     setSaved(false);
-  }, [kid && kid.id, kid && kid.categories]);
+  }, [kid && kid.id]);
 
   if (!kids.length) return <div className="sq-card" style={panel}><p style={{ color: "#7a6f8c" }}>Add a child first.</p></div>;
 
@@ -3263,11 +3821,19 @@ function CategoriesManager({ kids, refreshKids, activeKid, setActiveKid }) {
     setSelected((s) => ({ ...s, [subject]: (s[subject] || []).filter((x) => x !== name) }));
   };
 
+  const setCount = (subject, val) => {
+    setSaved(false);
+    let n = parseInt(val, 10);
+    if (!Number.isFinite(n)) n = 0;
+    n = Math.max(0, Math.min(20, n));
+    setCounts((c) => ({ ...c, [subject]: n }));
+  };
+
   const save = async () => {
     if (!kid) return;
     setBusy(true);
     try {
-      const ks = await api.updateKid(kid.id, { categories: { selected, custom } });
+      const ks = await api.updateKid(kid.id, { categories: { selected, custom }, counts });
       await refreshKids(ks);
       setSaved(true);
     } finally {
@@ -3279,7 +3845,7 @@ function CategoriesManager({ kids, refreshKids, activeKid, setActiveKid }) {
     <div className="sq-card" style={panel}>
       <h2 className="sq-h" style={{ ...h2, marginTop: 0 }}>Question Categories</h2>
       <p style={{ color: "#7a6f8c", marginTop: -8 }}>
-        Pick which topics to include in {kid ? kid.name + "'s" : "the"} questions each day. Changes apply to the next day's set.
+        Pick which topics to include in {kid ? kid.name + "'s" : "the"} questions each day, and how many questions each subject gets (0–20; set 0 to skip a subject). Changes apply to the next day's set.
       </p>
       <KidPicker kids={kids} activeKid={kid ? kid.id : null} setActiveKid={setActiveKid} />
 
@@ -3291,8 +3857,21 @@ function CategoriesManager({ kids, refreshKids, activeKid, setActiveKid }) {
         const allowCustom = true; // custom topics now allowed for every subject, including Math
         return (
           <div key={s.key} style={{ padding: "14px 0", borderBottom: "1px solid #f0ecf6" }}>
-            <h3 className="sq-h" style={{ margin: "0 0 10px", fontSize: 18, color: s.color }}>{s.key}</h3>
-            <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, flexWrap: "wrap", marginBottom: 10 }}>
+              <h3 className="sq-h" style={{ margin: 0, fontSize: 18, color: s.color }}>{s.key}</h3>
+              <label style={{ display: "inline-flex", alignItems: "center", gap: 6, fontSize: 13, color: "#7a6f8c", fontWeight: 700 }}>
+                Questions/day:
+                <input
+                  type="number"
+                  min={0}
+                  max={20}
+                  value={counts[s.key] ?? 10}
+                  onChange={(e) => setCount(s.key, e.target.value)}
+                  style={{ ...input, margin: 0, width: 64, padding: "6px 8px", textAlign: "center" }}
+                />
+              </label>
+            </div>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 8, opacity: (counts[s.key] ?? 10) === 0 ? 0.45 : 1 }}>
               {all.map((name) => {
                 const on = sel.has(name);
                 const isCustom = customCats.includes(name);
@@ -3479,6 +4058,8 @@ function KidsManager({ kids, refreshKids, activeKid, setActiveKid }) {
 function ChoresManager({ kids, activeKid, setActiveKid }) {
   const [chores, setChores] = useState([]);
   const [title, setTitle] = useState("");
+  const [dragIndex, setDragIndex] = useState(null);
+  const [overIndex, setOverIndex] = useState(null);
 
   useEffect(() => {
     (async () => {
@@ -3512,22 +4093,76 @@ function ChoresManager({ kids, activeKid, setActiveKid }) {
     );
   const setDaysPreset = (id, preset) => save(chores.map((c) => (c.id === id ? { ...c, days: preset.slice() } : c)));
 
+  // Move a chore from one position to another (used by both drag and arrows).
+  const move = (from, to) => {
+    if (from === to || from < 0 || to < 0 || from >= chores.length || to >= chores.length) return;
+    const next = chores.slice();
+    const [item] = next.splice(from, 1);
+    next.splice(to, 0, item);
+    save(next);
+  };
+
+  const onDrop = (to) => {
+    if (dragIndex != null) move(dragIndex, to);
+    setDragIndex(null);
+    setOverIndex(null);
+  };
+
   if (!kids.length) return <div className="sq-card" style={panel}><p style={{color:"#7a6f8c"}}>Add a child first.</p></div>;
 
   return (
     <div className="sq-card" style={panel}>
       <h2 className="sq-h" style={{ ...h2, marginTop: 0 }}>Chores Setup</h2>
-      <p style={{ color: "#7a6f8c", marginTop: -8 }}>Pick which days each chore should appear. Kids only see a chore on its days.</p>
+      <p style={{ color: "#7a6f8c", marginTop: -8 }}>Pick which days each chore should appear. Drag the ⠿ handle (or use the ↑ ↓ arrows) to reorder. Kids only see a chore on its days.</p>
       <KidPicker kids={kids} activeKid={activeKid} setActiveKid={setActiveKid} />
-      {chores.map((c) => {
+      {chores.map((c, idx) => {
         const days = Array.isArray(c.days) ? c.days : ALL_DAYS;
+        const isOver = overIndex === idx && dragIndex !== null && dragIndex !== idx;
         return (
-          <div key={c.id} style={{ padding: "12px 0", borderBottom: "1px solid #f0ecf6" }}>
-            <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-              <input style={{ ...input, margin: 0 }} value={c.title} onChange={(e) => edit(c.id, e.target.value)} />
+          <div
+            key={c.id}
+            onDragOver={(e) => { e.preventDefault(); if (overIndex !== idx) setOverIndex(idx); }}
+            onDrop={() => onDrop(idx)}
+            style={{
+              padding: "12px 0",
+              borderBottom: "1px solid #f0ecf6",
+              borderTop: isOver ? "2px solid #4a3f5e" : "2px solid transparent",
+              opacity: dragIndex === idx ? 0.5 : 1,
+              background: isOver ? "#f6f3fb" : "transparent",
+            }}
+          >
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <span
+                draggable
+                onDragStart={() => setDragIndex(idx)}
+                onDragEnd={() => { setDragIndex(null); setOverIndex(null); }}
+                title="Drag to reorder"
+                style={{ cursor: "grab", color: "#bcb2cf", fontSize: 18, padding: "0 4px", userSelect: "none", touchAction: "none" }}
+              >
+                ⠿
+              </span>
+              <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                <button
+                  onClick={() => move(idx, idx - 1)}
+                  disabled={idx === 0}
+                  title="Move up"
+                  style={{ border: "none", background: "none", cursor: idx === 0 ? "default" : "pointer", color: idx === 0 ? "#d8d0e6" : "#7a6f8c", fontSize: 12, lineHeight: 1, padding: 0 }}
+                >
+                  ▲
+                </button>
+                <button
+                  onClick={() => move(idx, idx + 1)}
+                  disabled={idx === chores.length - 1}
+                  title="Move down"
+                  style={{ border: "none", background: "none", cursor: idx === chores.length - 1 ? "default" : "pointer", color: idx === chores.length - 1 ? "#d8d0e6" : "#7a6f8c", fontSize: 12, lineHeight: 1, padding: 0 }}
+                >
+                  ▼
+                </button>
+              </div>
+              <input style={{ ...input, margin: 0, flex: 1 }} value={c.title} onChange={(e) => edit(c.id, e.target.value)} />
               <button style={{ ...btnGhost, borderColor: "#e0506b", color: "#e0506b" }} onClick={() => remove(c.id)}>✕</button>
             </div>
-            <div style={{ display: "flex", gap: 6, marginTop: 8, flexWrap: "wrap", alignItems: "center" }}>
+            <div style={{ display: "flex", gap: 6, marginTop: 8, flexWrap: "wrap", alignItems: "center", paddingLeft: 30 }}>
               {WEEKDAYS.map((label, dow) => {
                 const on = days.includes(dow);
                 return (

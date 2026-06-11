@@ -29,11 +29,87 @@ const TOKEN_TTL_MS = 1000 * 60 * 60 * 24 * 30; // 30 days
 
 const db = () => getStore("studyquest");
 
+/* ------------------------------- logging -------------------------------
+   Server-side event log for admin troubleshooting. Entries are written to
+   Netlify Blobs under date-bucketed keys so they can be queried by day and
+   pruned by day. Each entry records a level, message, event type, and context
+   (family id, username/email, request id, and structured details).
+
+   Levels (most -> least severe): error, warn, info, verbose, debug.
+   LOG_LEVEL env controls what actually gets persisted (default "info"), so
+   verbose/debug can be enabled only when needed. Writing never throws — a
+   logging failure must never break a request.                               */
+const LOG_LEVELS = ["error", "warn", "info", "verbose", "debug"];
+const LOG_LEVEL_RANK = { error: 0, warn: 1, info: 2, verbose: 3, debug: 4 };
+const activeLogLevel = () => {
+  const lvl = String(process.env.LOG_LEVEL || "info").toLowerCase();
+  return LOG_LEVEL_RANK[lvl] != null ? lvl : "info";
+};
+const LOG_RETENTION_DAYS = Number(process.env.LOG_RETENTION_DAYS) || 30;
+
+function dayKeyUTC(ts) {
+  return new Date(ts).toISOString().slice(0, 10); // YYYY-MM-DD (UTC)
+}
+
+// Redact obviously-sensitive keys so secrets never land in the log.
+function redact(details) {
+  if (!details || typeof details !== "object") return details;
+  const out = {};
+  const SENSITIVE = /(password|passwd|token|secret|hash|salt|authorization|apikey|api_key)/i;
+  for (const k of Object.keys(details).slice(0, 40)) {
+    if (SENSITIVE.test(k)) {
+      out[k] = "[redacted]";
+    } else {
+      let v = details[k];
+      if (typeof v === "string" && v.length > 300) v = v.slice(0, 300) + "…";
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
+// Write a log entry. ctx may include { fid, username, requestId, status }.
+// Returns nothing and never throws.
+async function logEvent(level, event, message, ctx = {}, details = null) {
+  try {
+    const lvl = LOG_LEVELS.includes(level) ? level : "info";
+    if (LOG_LEVEL_RANK[lvl] > LOG_LEVEL_RANK[activeLogLevel()]) return; // below threshold
+    const ts = Date.now();
+    const rand = Math.random().toString(36).slice(2, 8);
+    const entry = {
+      ts,
+      iso: new Date(ts).toISOString(),
+      level: lvl,
+      event: String(event || "").slice(0, 80),
+      message: String(message == null ? "" : message).slice(0, 500),
+      fid: ctx.fid ? String(ctx.fid).slice(0, 40) : "",
+      username: ctx.username ? String(ctx.username).slice(0, 120).toLowerCase() : "",
+      requestId: ctx.requestId ? String(ctx.requestId).slice(0, 24) : "",
+      status: ctx.status != null ? Number(ctx.status) : undefined,
+      details: details ? redact(details) : undefined,
+    };
+    // key sorts chronologically within a day bucket
+    const key = `log:${dayKeyUTC(ts)}:${String(ts).padStart(15, "0")}-${rand}`;
+    await db().setJSON(key, entry);
+  } catch {
+    /* logging must never break the app */
+  }
+}
+
+// Generate a short request id for correlating log lines within one request.
+function makeRequestId() {
+  return Date.now().toString(36).slice(-5) + Math.random().toString(36).slice(2, 6);
+}
+
+/* ----------------------------- end logging ----------------------------- */
+
 /* ----------------------------- main router ----------------------------- */
 export default async (request) => {
   if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
 
   const action = new URL(request.url).pathname.split("/").filter(Boolean).pop();
+  const requestId = makeRequestId();
+  request.__rid = requestId; // available to auth wrappers for context
 
   let body = {};
   try {
@@ -42,7 +118,23 @@ export default async (request) => {
     body = {};
   }
 
+  // verbose: every incoming request (action only — never the body, which may
+  // contain passwords). The log-query endpoints are excluded to avoid noise.
+  if (action !== "admin-logs" && action !== "admin-log-clear") {
+    logEvent("verbose", "request", `→ ${action}`, { requestId });
+  }
+
   try {
+    const res = await routeAction(action, request, body, requestId);
+    return res;
+  } catch (e) {
+    logEvent("error", "unhandled", `Unhandled error in ${action}: ${e && e.message}`, { requestId }, { stack: e && e.stack ? String(e.stack).slice(0, 600) : undefined });
+    return json({ error: "Server error", detail: String(e && e.message) }, 500);
+  }
+};
+
+async function routeAction(action, request, body, requestId) {
+  {
     switch (action) {
       // --- auth / first-run / public (no token required) ---
       case "signup":
@@ -85,6 +177,12 @@ export default async (request) => {
         return await withParent(request, (auth) => handleChangeEmail(auth, body));
       case "family-info":
         return await withParent(request, (auth) => handleFamilyInfo(auth));
+      case "family-join":
+        return await withParent(request, (auth) => handleFamilyJoin(auth, body));
+      case "family-join-preview":
+        return await withParent(request, (auth) => handleFamilyJoinPreview(auth, body));
+      case "family-rename":
+        return await withParent(request, (auth) => handleFamilyRename(auth, body));
       case "family-regen-code":
         return await withParent(request, (auth) => handleFamilyRegenCode(auth));
       case "kid-create":
@@ -99,23 +197,33 @@ export default async (request) => {
         return await withAdmin(request, () => handleAdminListUsers());
       case "admin-reset-password":
         return await withAdmin(request, () => handleAdminResetPassword(body));
+      case "admin-logs":
+        return await withAdmin(request, () => handleAdminLogs(body));
+      case "admin-log-clear":
+        return await withAdmin(request, () => handleAdminLogClear(body));
 
       default:
+        logEvent("warn", "unknown_action", `Unknown action: ${action}`, { requestId });
         return json({ error: "Unknown action" }, 404);
     }
-  } catch (e) {
-    return json({ error: "Server error", detail: String(e && e.message) }, 500);
   }
-};
+}
 
 export const config = { path: "/api/:action" };
 
 /* ------------------------------- auth bits ------------------------------ */
 
 function requireSecret() {
+  // Prefer an explicit SESSION_SECRET if provided. If it's not set, derive a
+  // stable signing key from another secret that's always present (the Anthropic
+  // key). This means operators don't have to manage a separate secret env var,
+  // and avoids Netlify's secret-scanning blocking the build over it. Tokens
+  // stay signed and stable for the life of the deploy.
   const s = process.env.SESSION_SECRET;
-  if (!s) throw new Error("Server is missing SESSION_SECRET environment variable");
-  return s;
+  if (s) return s;
+  const fallback = process.env.ANTHROPIC_API_KEY;
+  if (fallback) return "sq::" + fallback;
+  throw new Error("Server is missing ANTHROPIC_API_KEY environment variable");
 }
 
 function signToken(pid) {
@@ -250,6 +358,7 @@ async function handleSignup(body) {
   const email = normEmail(body.email || body.username); // accept either field name
   const password = String(body.password || "");
   const joinCode = String(body.familyCode || "").trim().toUpperCase();
+  const familyName = sanitizeFamilyName(body.familyName);
   if (!isEmail(email)) return json({ error: "Enter a valid email address." }, 400);
   if (password.length < 6) return json({ error: "Password must be at least 6 characters." }, 400);
 
@@ -265,7 +374,7 @@ async function handleSignup(body) {
     return json({ error: "An account with that email already exists. Try logging in." }, 409);
   }
 
-  // Join an existing family by code, or start a new one.
+  // Join an existing family by code, or start a new one (optionally named).
   let familyId;
   if (joinCode) {
     const fid = await store.get(`familycode:${joinCode}`);
@@ -274,7 +383,7 @@ async function handleSignup(body) {
   } else {
     familyId = uid();
     const code = familyCode();
-    await store.setJSON(`family:${familyId}`, { id: familyId, code, accessNonce: 0, createdAt: Date.now() });
+    await store.setJSON(`family:${familyId}`, { id: familyId, code, name: familyName, accessNonce: 0, createdAt: Date.now() });
     await store.set(`familycode:${code}`, familyId);
     await store.setJSON(`kids:${familyId}`, []);
   }
@@ -294,6 +403,7 @@ async function handleSignup(body) {
   await store.set(`uname:${email}`, pid);
 
   const sent = await sendVerificationEmail(store, { id: pid, email });
+  logEvent("info", "signup", `New account: ${email}${joinCode ? " (joined family by code)" : " (new family)"}`, { username: email, fid: familyId }, { emailConfigured: sent.configured });
   return json({ pending: true, email, emailConfigured: sent.configured, devLink: sent.devLink || undefined }, 200);
 }
 
@@ -307,16 +417,22 @@ async function handleLogin(body) {
   // allow the special admin to log in by "admin" (not an email)
   const lookup = email === "admin" ? "admin" : email;
   const pid = await store.get(`uname:${lookup}`);
-  if (!pid) return json({ error: "Incorrect email or password." }, 401);
+  if (!pid) {
+    logEvent("warn", "login_failed", `Login failed (no such account): ${email}`, { username: email });
+    return json({ error: "Incorrect email or password." }, 401);
+  }
 
   const parent = await store.get(`parent:${pid}`, { type: "json" });
   if (!parent || !checkPassword(password, parent.salt, parent.hash)) {
+    logEvent("warn", "login_failed", `Login failed (bad password): ${email}`, { username: email, fid: parent && parent.familyId });
     return json({ error: "Incorrect email or password." }, 401);
   }
   if (!parent.isAdmin && !parent.verified) {
+    logEvent("info", "login_unverified", `Login blocked, email unverified: ${email}`, { username: email, fid: parent.familyId });
     return json({ error: "Please verify your email first. Check your inbox for the link.", unverified: true, email: parent.email }, 403);
   }
   await ensureFamily(store, parent);
+  logEvent("info", "login", `Login OK: ${email}${parent.isAdmin ? " (admin)" : ""}`, { username: email, fid: parent.familyId });
   return json({ token: signToken(pid), parent: publicParent(parent) }, 200);
 }
 
@@ -366,7 +482,9 @@ async function handleFamilyAccess(body) {
 }
 
 async function handleMe(auth) {
-  return json({ parent: publicParent(auth.parent) }, 200);
+  const store = db();
+  const fam = await store.get(`family:${auth.fid}`, { type: "json" });
+  return json({ parent: publicParent(auth.parent), familyName: (fam && fam.name) || "", familyCode: (fam && fam.code) || "" }, 200);
 }
 
 async function handleVerifyPassword(auth, body) {
@@ -419,7 +537,135 @@ async function handleFamilyInfo(auth) {
     if (p && p.familyId === fid) members.push({ email: p.email || p.username, isAdmin: !!p.isAdmin, isYou: p.id === auth.pid, verified: !!p.verified || !!p.isAdmin });
   }
   members.sort((a, b) => a.email.localeCompare(b.email));
-  return json({ code: fam ? fam.code : "", members }, 200);
+  return json({ code: fam ? fam.code : "", name: (fam && fam.name) || "", members }, 200);
+}
+
+// An already-logged-in parent joins another family via an invite code. Admins
+// can't be moved out of their setup family. When a parent leaves their old
+// family and no other parents remain in it, that old family (and its kids/data)
+// is deleted so it doesn't linger.
+// Rename the caller's family (or set a name if it never had one).
+async function handleFamilyRename(auth, body) {
+  const store = db();
+  const name = sanitizeFamilyName(body.name);
+  const fam = (await store.get(`family:${auth.fid}`, { type: "json" })) || { id: auth.fid };
+  fam.id = auth.fid;
+  fam.name = name;
+  await store.setJSON(`family:${auth.fid}`, fam);
+  return json({ ok: true, name }, 200);
+}
+
+// Preview what joining a family by code would do, so the UI can confirm before
+// any deletion. Reports the target family's name, whether the caller is already
+// a member, and — if joining would leave their current family empty — how many
+// kids would be deleted along with it.
+async function handleFamilyJoinPreview(auth, body) {
+  const store = db();
+  const code = String(body.code || "").trim().toUpperCase();
+  if (!code) return json({ error: "Missing invite code." }, 400);
+  if (auth.parent && auth.parent.isAdmin) return json({ error: "The admin account can't change families." }, 403);
+
+  const targetFid = await store.get(`familycode:${code}`);
+  if (!targetFid) return json({ error: "That invite is no longer valid." }, 404);
+
+  const targetFam = await store.get(`family:${targetFid}`, { type: "json" });
+  const targetName = (targetFam && targetFam.name) || "";
+
+  if (targetFid === auth.fid) {
+    return json({ alreadyMember: true, targetName }, 200);
+  }
+
+  // Would the caller's current family be left with no other parents?
+  const { blobs } = await store.list({ prefix: "parent:" });
+  let othersInCurrent = 0;
+  for (const b of blobs) {
+    const pp = await store.get(b.key, { type: "json" });
+    if (pp && pp.familyId === auth.fid && pp.id !== auth.pid) othersInCurrent++;
+  }
+  const willDeleteOld = othersInCurrent === 0;
+  let kidsLost = 0;
+  if (willDeleteOld) {
+    const kids = (await store.get(`kids:${auth.fid}`, { type: "json" })) || [];
+    kidsLost = kids.length;
+  }
+
+  const currentFam = await store.get(`family:${auth.fid}`, { type: "json" });
+  return json(
+    {
+      alreadyMember: false,
+      targetName,
+      willDeleteOld,
+      kidsLost,
+      currentName: (currentFam && currentFam.name) || "",
+    },
+    200
+  );
+}
+
+// An already-logged-in parent joins another family via an invite code. Admins
+// can't be moved out of their setup family. When a parent leaves their old
+// family and no other parents remain in it, that old family (and its kids/data)
+// is deleted so it doesn't linger.
+async function handleFamilyJoin(auth, body) {
+  const store = db();
+  const code = String(body.code || "").trim().toUpperCase();
+  if (!code) return json({ error: "Missing invite code." }, 400);
+  if (auth.parent && auth.parent.isAdmin) return json({ error: "The admin account can't change families." }, 403);
+
+  const targetFid = await store.get(`familycode:${code}`);
+  if (!targetFid) return json({ error: "That invite is no longer valid." }, 404);
+  if (targetFid === auth.fid) return json({ ok: true, alreadyMember: true }, 200);
+
+  const parent = await store.get(`parent:${auth.pid}`, { type: "json" });
+  if (!parent) return json({ error: "Account not found." }, 404);
+
+  const oldFid = parent.familyId;
+  parent.familyId = targetFid;
+  await store.setJSON(`parent:${auth.pid}`, parent);
+  logEvent("info", "family_join", `${parent.email || parent.username} joined family ${targetFid}`, { username: parent.email || parent.username, fid: targetFid }, { fromFamily: oldFid });
+
+  // If the parent's old family now has no other members, delete it entirely.
+  if (oldFid && oldFid !== targetFid) {
+    const deleted = await deleteFamilyIfEmpty(store, oldFid, auth.pid);
+    if (deleted) {
+      logEvent("warn", "family_deleted", `Family ${oldFid} deleted (last member left)`, { username: parent.email || parent.username, fid: oldFid });
+    }
+  }
+
+  return json({ ok: true, parent: publicParent(parent) }, 200);
+}
+
+// Delete a family and all its data IF no parents remain in it (excluding the
+// one who just left, identified by leavingPid). Safe no-op if others remain.
+async function deleteFamilyIfEmpty(store, fid, leavingPid) {
+  const { blobs } = await store.list({ prefix: "parent:" });
+  for (const b of blobs) {
+    const p = await store.get(b.key, { type: "json" });
+    if (p && p.familyId === fid && p.id !== leavingPid) {
+      return false; // someone else is still in this family — keep it
+    }
+  }
+  // No remaining members: remove family record, code mapping, kids, and all
+  // per-kid data blobs.
+  try {
+    const fam = await store.get(`family:${fid}`, { type: "json" });
+    if (fam && fam.code) await store.delete(`familycode:${fam.code}`);
+    await store.delete(`family:${fid}`);
+
+    const kids = (await store.get(`kids:${fid}`, { type: "json" })) || [];
+    const kidIds = new Set(kids.map((k) => k.id));
+    await store.delete(`kids:${fid}`);
+
+    const { blobs: dataBlobs } = await store.list({ prefix: "d:" });
+    await Promise.all(
+      dataBlobs
+        .filter((b) => kidIds.has(keyKidId(b.key.slice(2))))
+        .map((b) => store.delete(b.key))
+    );
+  } catch {
+    /* best-effort cleanup */
+  }
+  return true;
 }
 
 // Regenerate the family code AND revoke existing kid-device links.
@@ -516,7 +762,113 @@ async function handleAdminResetPassword(body) {
 
   const { salt, hash } = hashPassword(newPassword);
   await store.setJSON(`parent:${pid}`, { ...parent, salt, hash });
+  logEvent("warn", "admin_reset_pw", `Admin reset password for ${parent.email || parent.username}`, { username: parent.email || parent.username, fid: parent.familyId });
   return json({ ok: true, email: parent.email || parent.username }, 200);
+}
+
+/* ----------------------- admin: event log access ----------------------- */
+// Map a username/email or family-name filter to the matching family ids so the
+// admin can query by either. Returns null if no resolution is needed.
+async function resolveFamilyFilter(store, familyQuery) {
+  const q = String(familyQuery || "").trim().toLowerCase();
+  if (!q) return null;
+  const fids = new Set();
+  // match a family by id directly (compare lowercased)
+  fids.add(q);
+  // match by family name
+  try {
+    const { blobs } = await store.list({ prefix: "family:" });
+    for (const b of blobs) {
+      const fam = await store.get(b.key, { type: "json" });
+      if (fam && fam.name && fam.name.toLowerCase().includes(q)) fids.add(String(fam.id).toLowerCase());
+      if (fam && fam.id && String(fam.id).toLowerCase() === q) fids.add(String(fam.id).toLowerCase());
+    }
+  } catch {}
+  return fids;
+}
+
+async function handleAdminLogs(body) {
+  const store = db();
+  const levelFilter = String(body.level || "debug").toLowerCase(); // include this level and more severe
+  const maxRank = LOG_LEVEL_RANK[levelFilter] != null ? LOG_LEVEL_RANK[levelFilter] : LOG_LEVEL_RANK.debug;
+  const fromDate = /^\d{4}-\d{2}-\d{2}$/.test(body.from || "") ? body.from : null;
+  const toDate = /^\d{4}-\d{2}-\d{2}$/.test(body.to || "") ? body.to : null;
+  const usernameQ = String(body.username || "").trim().toLowerCase();
+  const familyQ = String(body.family || "").trim().toLowerCase();
+  const textQ = String(body.text || "").trim().toLowerCase();
+  const limit = Math.max(1, Math.min(1000, Number(body.limit) || 200));
+
+  // Resolve which day buckets to scan. If a date range is given, only list
+  // those days' keys (efficient). Otherwise list all log keys.
+  let keys = [];
+  try {
+    if (fromDate || toDate) {
+      // enumerate day buckets within [from, to]
+      const start = fromDate || "0000-00-00";
+      const end = toDate || "9999-99-99";
+      const { blobs } = await store.list({ prefix: "log:" });
+      keys = blobs
+        .map((b) => b.key)
+        .filter((k) => {
+          const day = k.slice(4, 14); // YYYY-MM-DD
+          return day >= start && day <= end;
+        });
+    } else {
+      const { blobs } = await store.list({ prefix: "log:" });
+      keys = blobs.map((b) => b.key);
+    }
+  } catch {
+    keys = [];
+  }
+
+  // Newest first by key (keys embed zero-padded timestamps), then cap how many
+  // entries we load to avoid scanning unbounded history.
+  keys.sort((a, b) => (a < b ? 1 : a > b ? -1 : 0));
+  const SCAN_CAP = 4000;
+  keys = keys.slice(0, SCAN_CAP);
+
+  const famFilter = familyQ ? await resolveFamilyFilter(store, familyQ) : null;
+
+  const out = [];
+  for (const key of keys) {
+    if (out.length >= limit) break;
+    let e;
+    try {
+      e = await store.get(key, { type: "json" });
+    } catch {
+      continue;
+    }
+    if (!e) continue;
+    if (LOG_LEVEL_RANK[e.level] > maxRank) continue;
+    if (usernameQ && !(e.username || "").includes(usernameQ)) continue;
+    if (famFilter && !famFilter.has((e.fid || "").toLowerCase())) continue;
+    if (textQ) {
+      const hay = `${e.event} ${e.message} ${JSON.stringify(e.details || "")}`.toLowerCase();
+      if (!hay.includes(textQ)) continue;
+    }
+    out.push(e);
+  }
+
+  return json({ entries: out, scanned: keys.length, level: levelFilter, activeLevel: activeLogLevel() }, 200);
+}
+
+// Delete logs, optionally only those older than a given date (YYYY-MM-DD).
+async function handleAdminLogClear(body) {
+  const store = db();
+  const olderThan = /^\d{4}-\d{2}-\d{2}$/.test(body.olderThan || "") ? body.olderThan : null;
+  let removed = 0;
+  try {
+    const { blobs } = await store.list({ prefix: "log:" });
+    for (const b of blobs) {
+      const day = b.key.slice(4, 14);
+      if (!olderThan || day < olderThan) {
+        await store.delete(b.key);
+        removed++;
+      }
+    }
+  } catch {}
+  logEvent("warn", "logs_cleared", `Admin cleared logs${olderThan ? ` older than ${olderThan}` : " (all)"} — ${removed} removed`, {});
+  return json({ ok: true, removed }, 200);
 }
 
 async function getKids(store, familyId) {
@@ -526,7 +878,8 @@ async function getKids(store, familyId) {
 async function handleKidsList(auth) {
   const store = db();
   const kids = await getKids(store, auth.fid);
-  return json({ kids: kids.map(publicKid) }, 200);
+  const fam = await store.get(`family:${auth.fid}`, { type: "json" });
+  return json({ kids: kids.map(publicKid), familyName: (fam && fam.name) || "" }, 200);
 }
 
 async function handleKidCreate(auth, body) {
@@ -555,6 +908,9 @@ async function handleKidUpdate(auth, body) {
   if (body.grade != null) kids[idx].grade = clampGrade(body.grade);
   if (body.categories && typeof body.categories === "object") {
     kids[idx].categories = sanitizeCategories(body.categories);
+  }
+  if (body.counts && typeof body.counts === "object") {
+    kids[idx].counts = sanitizeCounts(body.counts);
   }
   await store.setJSON(`kids:${fid}`, kids);
   return json({ kids: kids.map(publicKid) }, 200);
@@ -694,10 +1050,12 @@ async function handleGrade(auth, body) {
       body: JSON.stringify({ model: MODEL, max_tokens: 1024, messages: [{ role: "user", content: prompt }] }),
     });
   } catch {
+    logEvent("error", "grade_failed", "Grading upstream request failed", { fid: auth && auth.fid });
     return json({ error: "Upstream request failed" }, 502);
   }
   if (!aiRes.ok) {
     const detail = await safeText(aiRes);
+    logEvent("error", "grade_failed", `Grading API error (status ${aiRes.status})`, { fid: auth && auth.fid, status: aiRes.status });
     return json({ error: "Anthropic API error", status: aiRes.status, detail }, 502);
   }
 
@@ -782,8 +1140,11 @@ async function handleGenerate(auth, body) {
   const safe = requests.slice(0, 8).map((r) => ({
     subject: String(r.subject || "").slice(0, 80),
     categories: (Array.isArray(r.categories) ? r.categories : []).filter((c) => typeof c === "string").map((c) => c.slice(0, 40)).slice(0, 30),
-    count: Math.max(1, Math.min(10, Number(r.count) || 10)),
+    count: Math.max(1, Math.min(20, Number(r.count) || 10)),
   }));
+  // scale the token budget with how many questions are requested
+  const totalQ = safe.reduce((n, r) => n + r.count, 0);
+  const genTokens = Math.min(8000, Math.max(2000, totalQ * 90));
 
   const prompt =
     `You are an experienced ${gradeLabel(grade)} teacher writing a short-answer practice worksheet.\n` +
@@ -798,8 +1159,9 @@ async function handleGenerate(auth, body) {
 
   let text;
   try {
-    text = await callClaude(prompt, 2000);
+    text = await callClaude(prompt, genTokens);
   } catch (e) {
+    logEvent("error", "generate_failed", `Question generation API error: ${e && e.message}`, { fid: auth && auth.fid }, { code: e && e.code });
     return json({ error: e.message }, e.code || 502);
   }
 
@@ -807,6 +1169,7 @@ async function handleGenerate(auth, body) {
   try {
     parsed = JSON.parse(stripFences(text));
   } catch {
+    logEvent("error", "generate_parse", "Could not parse generated questions from model", { fid: auth && auth.fid });
     return json({ error: "Could not parse generated questions" }, 502);
   }
   const q = parsed && parsed.questions && typeof parsed.questions === "object" ? parsed.questions : null;
@@ -948,8 +1311,10 @@ async function handleNotify(auth, body) {
     try {
       await store.delete(flagKey);
     } catch {}
+    logEvent("info", "notify_skipped", `Completion email (${type}) not sent — email not configured`, { fid: auth.fid }, { kidId, date });
     return json({ sent: 0, emailConfigured: false }, 200);
   }
+  logEvent("info", "notify_sent", `Completion email (${type}) sent to ${sent} parent(s)`, { fid: auth.fid }, { kidId, date, recipients: recipients.length });
   return json({ sent, emailConfigured: true }, 200);
 }
 
@@ -1040,8 +1405,24 @@ function gradeLabel(g) {
   return g <= 5 ? "elementary school" : g <= 8 ? "middle school" : "high school";
 }
 
+function sanitizeFamilyName(name) {
+  const s = String(name == null ? "" : name).replace(/[\u0000-\u001f\u007f]/g, " ").trim();
+  return s.slice(0, 40);
+}
+
+function sanitizeCounts(counts) {
+  const out = {};
+  if (counts && typeof counts === "object") {
+    for (const k of Object.keys(counts).slice(0, 12)) {
+      const n = Math.round(Number(counts[k]));
+      if (Number.isFinite(n)) out[String(k).slice(0, 40)] = Math.max(0, Math.min(20, n));
+    }
+  }
+  return out;
+}
+
 function publicKid(k) {
-  return { id: k.id, name: k.name, grade: k.grade, categories: k.categories || null };
+  return { id: k.id, name: k.name, grade: k.grade, categories: k.categories || null, counts: k.counts || null };
 }
 function publicParent(p) {
   return { email: p.email || p.username, isAdmin: !!p.isAdmin, verified: !!p.verified || !!p.isAdmin };
@@ -1122,6 +1503,7 @@ async function checkRateLimit(auth, action) {
     }
     counts.push(n);
     if (n >= w.limit) {
+      logEvent("warn", "rate_limited", `Rate limit hit for "${action}"`, { fid: auth && auth.fid }, { limit: w.limit });
       return json(
         {
           error: "You're checking a bit too fast. Please wait a moment and try again.",

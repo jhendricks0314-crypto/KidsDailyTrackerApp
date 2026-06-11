@@ -50,13 +50,11 @@ Set these in **Netlify → Site configuration → Environment variables**:
 
 | Variable            | Required | Notes                                                            |
 |---------------------|----------|------------------------------------------------------------------|
-| `ANTHROPIC_API_KEY` | yes      | Your Anthropic key (`sk-ant-...`).                               |
-| `SESSION_SECRET`    | yes      | Long random string used to sign login tokens (see below).       |
+| `ANTHROPIC_API_KEY` | yes      | Your Anthropic key (`sk-ant-...`).                              |
 | `ANTHROPIC_MODEL`   | no       | Defaults to `claude-sonnet-4-6`.                                 |
 
-Generate a good `SESSION_SECRET`:
-
-> Note: changing `SESSION_SECRET` later logs everyone out (they just log back in).
+Login tokens are signed automatically using your `ANTHROPIC_API_KEY`, so there's
+no separate signing secret to set up or paste anywhere.
 
 ---
 
@@ -69,7 +67,7 @@ Generate a good `SESSION_SECRET`:
    (build command `npm run build`, publish directory `dist`, functions in
    `netlify/functions`) fill in automatically.
 4. Go to **Site configuration → Environment variables** and add
-   `ANTHROPIC_API_KEY` and `SESSION_SECRET` (and optionally `ANTHROPIC_MODEL`).
+   `ANTHROPIC_API_KEY` (and optionally `ANTHROPIC_MODEL`).
 5. Trigger a deploy (**Deploys → Trigger deploy → Deploy site**).
 6. Open the site URL on your tablet, create your parent account, then use
    Chrome's menu → **Add to Home Screen**.
@@ -400,3 +398,84 @@ Student answers are treated strictly as data, never as instructions:
   "incorrect."** Only a strict `correct: true` counts as correct, and non-JSON
   model output is rejected. So a manipulated answer can't force a pass or change
   how many questions were graded.
+
+## More updates
+
+- **Admin login fixed:** log in with the username `admin` (the login field now
+  accepts it instead of requiring an email). Reset a parent's password from the
+  Parent area → 🛡️ Admin tab. If you forget the admin password, see "Admin
+  account" above.
+- **Per-kid categories are independent:** turning a topic off for one child no
+  longer affects another child — each child's selections load and save on their
+  own.
+- **Set questions per subject, per kid:** in Parent → Question Categories, each
+  subject has a "Questions/day" box (0–20). Set 0 to skip a subject entirely.
+  Fewer questions also means fewer AI calls.
+- **Chore reordering:** drag the ⠿ handle, or use the ▲ ▼ arrows, to reorder
+  chores in Parent → Chores Setup.
+- **Math charts now show y-axis values** (numbered gridlines), so bar/line-graph
+  questions are answerable.
+- **Reward ribbon:** it's centered, has a close (✕) button, shows how many plays
+  remain, and the game can be played at most 3 times per day before the ribbon
+  goes away.
+- **Calendar shows questions and chores together** (📚 and 🧹 on each day) and no
+  longer shows "undefined/undefined".
+- **No SESSION_SECRET needed:** login tokens are signed automatically from your
+  `ANTHROPIC_API_KEY`, so there's no separate secret to set (which also avoids
+  Netlify's secret-scanning blocking the build). You may still set your own
+  `SESSION_SECRET` if you prefer.
+
+## Inviting another parent (share link)
+
+In Parent → 👨‍👩‍👧 Family, use **📤 Share invite link** (or Copy link). Send it to
+another parent. When they open it, they're taken to a screen where they can
+**log in or create an account**, and they're added to your family automatically —
+no code to type. (A copy-the-code option is still there as a fallback, and you
+can regenerate the code to revoke an old invite.)
+
+Note: an invite link lets whoever opens it join your family and see your kids, so
+share it only with people you trust — same as the kids' link.
+
+## Parent area: unlock once per session
+
+Entering the Parent area asks for your account password once. After that you can
+move in and out of the parent tabs freely without re-entering it. Use **🔒 Lock**
+(in the Parent area header) to require the password again, or **← Exit parent
+mode** to return to the kid view without locking. Signing out also re-locks it.
+
+## Family names
+
+- **Name your family at sign-up.** When you create a new account (not joining an
+  existing family), there's an optional **Family name** field (e.g. "The Smith
+  Family").
+- **Shown in the header.** The family name appears under the StudyQuest title at
+  the top of the app, for everyone in the family (including the kids' link).
+- **Rename anytime.** Parent area → 👨‍👩‍👧 Family → **Family name** lets you set or
+  change it; the header updates immediately.
+- **Joining another family.** Opening an invite link (or entering a code) moves
+  you into that family. If your old family has no other parents left, it (and its
+  kids/data) is automatically deleted so nothing lingers. Before this happens, you'll see a confirmation warning that names your current family and how many children would be permanently deleted, so it never happens by surprise. If another parent is
+  still in your old family, it's kept for them.
+
+## Admin event logs (troubleshooting)
+
+Signed in as **admin**, open Parent area → **📋 Logs** to view server-side
+events for troubleshooting issues and workflows.
+
+- **Levels:** error, warn, info, verbose, debug. Pick a minimum level (it
+  includes everything more severe). Logged events include sign-ups, successful
+  and failed logins, email-verification, family joins and deletions, completion
+  emails, rate-limit hits, and AI generation/grading errors — plus a verbose
+  "request" line per call.
+- **Query by:** date range, **family** (id or name), **username/email**, free
+  text, and level. Use the Today / Last 7 days shortcuts for quick scoping.
+- **Details:** click "details" on an entry to see structured context (request
+  id, HTTP status, etc.). Secrets (passwords, tokens) are automatically redacted
+  and never logged.
+- **Retention:** use **🗑️ Clear logs…** to delete everything, or only entries
+  older than a date you choose.
+
+**What gets persisted** is controlled by the `LOG_LEVEL` env var (default
+`info`). Set it to `verbose` or `debug` temporarily while diagnosing something,
+then set it back — verbose logs every request and uses more storage. Logs live
+in Netlify Blobs alongside the app's other data; no extra setup is needed.
