@@ -27,13 +27,51 @@ const fmtDate = (key) => {
 
 const uid = () => Math.random().toString(36).slice(2, 10);
 
+// A stable, friendly avatar (color + emoji + initial) per kid, so a child can
+// recognize "their" profile at a glance. Derived from the kid id so it never
+// changes for a given child.
+const KID_COLORS = ["#e8743b", "#3b7de8", "#2fa84f", "#9b4dca", "#d4a017", "#e0506b", "#1f9d9d", "#7a5cd0"];
+const KID_EMOJIS = ["🦊", "🐼", "🦄", "🐯", "🐵", "🐶", "🐱", "🐨", "🦁", "🐸", "🐙", "🦉", "🐢", "🐰", "🐧", "🐝"];
+function kidHash(id) {
+  const s = String(id || "");
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+  return h;
+}
+function kidAvatar(kid) {
+  const h = kidHash(kid && kid.id);
+  const initial = (kid && kid.name ? kid.name.trim()[0] : "?") || "?";
+  return {
+    // prefer the kid's chosen color/icon; fall back to a stable default
+    color: (kid && kid.color) || KID_COLORS[h % KID_COLORS.length],
+    emoji: (kid && kid.icon) || KID_EMOJIS[h % KID_EMOJIS.length],
+    initial: initial.toUpperCase(),
+  };
+}
+
+// Icon + color choices for the kid avatar picker. Emoji only (no copyrighted
+// character artwork). Grouped loosely so kids can find a favorite.
+const AVATAR_ICONS = [
+  "🦊", "🐼", "🦄", "🐯", "🐵", "🐶", "🐱", "🐰", "🐸", "🐲", "🦖", "🦕",
+  "🦁", "🐨", "🐧", "🐙", "🦉", "🐝", "🦋", "🐢", "🐠", "🐬", "🦈", "🐳",
+  "🦸", "🦹", "🥷", "🧙", "🧚", "🧜", "🤖", "👾", "👽", "🤡", "🎃", "👻",
+  "🚀", "🚒", "🚌", "✈️", "🚁", "🏎️", "🚂", "⛵", "🛸", "🛹", "🎮", "⚽",
+  "🏀", "🏈", "⚾", "🎾", "🥎", "🏐", "🎲", "🎯", "🪀", "🎸", "🥁", "🎺",
+  "⭐", "🌈", "🔥", "⚡", "❄️", "🌸", "🌺", "🌻", "🍀", "🦴", "🍕", "🍦",
+];
+const AVATAR_COLORS = [
+  "#e8743b", "#3b7de8", "#2fa84f", "#9b4dca", "#d4a017", "#e0506b",
+  "#1f9d9d", "#7a5cd0", "#e84393", "#0984e3", "#00b894", "#fdcb6e",
+  "#6c5ce7", "#d63031", "#e17055", "#2d3436",
+];
+
 // Remove ?verify= / ?family= / ?invite= from the address bar after we've
 // consumed them, so a refresh or shared screenshot doesn't re-trigger or leak.
 const cleanUrl = () => {
   try {
     const url = new URL(window.location.href);
     let changed = false;
-    for (const p of ["verify", "family", "invite"]) {
+    for (const p of ["verify", "family", "invite", "reset"]) {
       if (url.searchParams.has(p)) {
         url.searchParams.delete(p);
         changed = true;
@@ -188,6 +226,12 @@ const api = {
   async familyRename(name) {
     return apiRequest("family-rename", { name });
   },
+  async notifySettings() {
+    return apiRequest("notify-settings");
+  },
+  async saveNotifySettings(settings) {
+    return apiRequest("notify-settings-save", settings);
+  },
   async familyRegenCode() {
     const r = await apiRequest("family-regen-code");
     return r && r.code;
@@ -203,6 +247,11 @@ const api = {
   },
   async updateKid(id, patch) {
     const r = await apiRequest("kid-update", { id, ...patch });
+    return (r && r.kids) || [];
+  },
+  // Kid-mode safe: change only the avatar icon/color.
+  async setKidAvatar(id, icon, color) {
+    const r = await apiRequest("kid-avatar", { id, icon, color });
     return (r && r.kids) || [];
   },
   async deleteKid(id) {
@@ -242,6 +291,23 @@ const api = {
   },
   async adminLogClear(olderThan) {
     return apiRequest("admin-log-clear", olderThan ? { olderThan } : {});
+  },
+  async adminCreateUser(email, familyId) {
+    return apiRequest("admin-create-user", { email, familyId });
+  },
+  async adminDeleteUser(id) {
+    return apiRequest("admin-delete-user", { id });
+  },
+  async adminSendReset(email) {
+    return apiRequest("admin-send-reset", { email });
+  },
+  async requestPasswordReset(email) {
+    return apiRequest("request-password-reset", { email });
+  },
+  async resetPassword(token, newPassword) {
+    const r = await apiRequest("reset-password", { token, newPassword });
+    if (r && r.token) setToken(r.token);
+    return r;
   },
 };
 
@@ -320,7 +386,7 @@ const MATH_GEN = {
     const num = a + b;
     return {
       type: "math",
-      q: `${a}/${d} + ${b}/${d} = ? (write your answer as a fraction like ${num}/${d})`,
+      q: `${a}/${d} + ${b}/${d} = ?  (write your answer as a fraction, for example 2/7)`,
       a: `${num}/${d}`,
       accept: [`${num}/${d}`],
     };
@@ -1028,6 +1094,20 @@ const css = `
 }
 .sq-install-btn:hover { background: #5a4f70; }
 
+/* exciting "play your game" button shown after the ribbon is closed */
+@keyframes sq-playpulse {
+  0%,100% { transform: scale(1); box-shadow: 0 6px 18px rgba(47,168,79,.35); }
+  50% { transform: scale(1.04); box-shadow: 0 8px 26px rgba(47,168,79,.5); }
+}
+.sq-playbtn {
+  display: inline-flex; align-items: center; gap: 10px;
+  padding: 12px 26px; border-radius: 999px; border: none; cursor: pointer;
+  background: linear-gradient(135deg,#2fa84f,#1f9d6d); color: #fff;
+  font-weight: 800; font-size: 16px; font-family: 'Fredoka', sans-serif;
+  animation: sq-playpulse 1.8s ease-in-out infinite;
+}
+.sq-playbtn:hover { filter: brightness(1.05); }
+
 /* ---- teacher help ---- */
 .sq-help-btn {
   margin-top: 8px; padding: 9px 16px; border-radius: 999px; border: none;
@@ -1060,6 +1140,7 @@ export default function App() {
   const [setupProtected, setSetupProtected] = useState(false);
   const [verifyState, setVerifyState] = useState(null); // {status:'working'|'error', message}
   const [inviteCode, setInviteCode] = useState(""); // co-parent invite link prefill
+  const [resetToken, setResetToken] = useState(""); // password-reset link token
   const [familyName, setFamilyName] = useState(""); // shown in the header
 
   // data
@@ -1073,6 +1154,7 @@ export default function App() {
   // ui
   const [tab, setTab] = useState("study"); // study | chores | calendar
   const [showReward, setShowReward] = useState(false); // reward game modal
+  const [showAvatarPicker, setShowAvatarPicker] = useState(false); // kid avatar customizer
   const [choreCeleb, setChoreCeleb] = useState(null); // celebration popup when all chores done
   const choreCelebRef = useRef({}); // `${kid}:${date}` shown already this session
   const lastAppCelebRef = useRef(-1); // vary the celebration shown
@@ -1123,6 +1205,13 @@ export default function App() {
       const verifyTok = params.get("verify");
       const familyCode = params.get("family");
       const invite = params.get("invite");
+      const resetTok = params.get("reset");
+
+      // Password-reset link: ?reset=<token> -> show the reset-password screen.
+      if (resetTok) {
+        setResetToken(resetTok);
+        cleanUrl();
+      }
 
       // Co-parent invite link: ?invite=<code> -> remember it and show the auth
       // screen pre-filled to join that family (they log in or sign up).
@@ -1412,6 +1501,26 @@ export default function App() {
       </div>
     );
 
+  // Password-reset landing (?reset=...) takes priority.
+  if (resetToken) {
+    return (
+      <ResetPasswordScreen
+        token={resetToken}
+        updateBanner={updateReady ? <UpdateBanner onUpdate={applyUpdate} /> : null}
+        onDone={async (parentObj) => {
+          setResetToken("");
+          if (parentObj) {
+            setParent(parentObj);
+            setFamilyMode(false);
+            setLoading(true);
+            try { await loadKidsInto(); } finally { setLoading(false); }
+          }
+        }}
+        onCancel={() => setResetToken("")}
+      />
+    );
+  }
+
   // Email-verification landing (?verify=...) — show while working or on error.
   if (verifyState) {
     return <VerifyScreen state={verifyState} onContinue={() => setVerifyState(null)} />;
@@ -1487,9 +1596,66 @@ export default function App() {
           onRenamed={setFamilyName}
         />
       ) : !kid ? (
-        <EmptyState onParent={() => setParentMode(true)} familyMode={familyMode} />
+        parent ? (
+          <OnboardingWizard
+            refreshKids={refreshKids}
+            setActiveKid={setActiveKid}
+            familyName={familyName}
+            onRenamed={setFamilyName}
+          />
+        ) : (
+          <EmptyState onParent={() => setParentMode(true)} familyMode={familyMode} />
+        )
       ) : (
         <>
+          {kid && (
+            <div
+              className="sq-noprint"
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 12,
+                background: "#fff",
+                border: `2px solid ${kidAvatar(kid).color}`,
+                borderRadius: 16,
+                padding: "10px 16px",
+                marginBottom: 14,
+                boxShadow: "0 4px 14px rgba(74,63,94,.08)",
+              }}
+            >
+              <button
+                onClick={() => setShowAvatarPicker(true)}
+                title="Tap to change your icon and color"
+                style={{
+                  width: 44,
+                  height: 44,
+                  borderRadius: "50%",
+                  background: kidAvatar(kid).color,
+                  color: "#fff",
+                  display: "grid",
+                  placeItems: "center",
+                  fontSize: 24,
+                  flexShrink: 0,
+                  border: "none",
+                  cursor: "pointer",
+                  position: "relative",
+                }}
+              >
+                {kidAvatar(kid).emoji}
+                <span style={{ position: "absolute", bottom: -3, right: -3, width: 18, height: 18, borderRadius: "50%", background: "#fff", border: "1px solid #e3dcec", display: "grid", placeItems: "center", fontSize: 10 }}>✏️</span>
+              </button>
+              <div style={{ lineHeight: 1.2 }}>
+                <div style={{ fontSize: 12, color: "#9a8fb0", fontWeight: 700 }}>Now playing</div>
+                <div className="sq-h" style={{ fontSize: 20, fontWeight: 800, color: kidAvatar(kid).color }}>{kid.name}</div>
+                <button onClick={() => setShowAvatarPicker(true)} style={{ ...miniLink, padding: 0, color: kidAvatar(kid).color }}>✨ Change my icon</button>
+              </div>
+              {kids.length > 1 && (
+                <div style={{ marginLeft: "auto", fontSize: 12, color: "#9a8fb0", fontWeight: 700, textAlign: "right" }}>
+                  Not you?<br />Tap your face up top ☝️
+                </div>
+              )}
+            </div>
+          )}
           <TabBar tab={tab} setTab={setTab} />
           {showRibbon && (
             <div
@@ -1530,6 +1696,19 @@ export default function App() {
               </button>
             </div>
           )}
+          {/* After the ribbon is closed, keep just an exciting button to reopen the game. */}
+          {rewardEarned && rewardDismissed && rewardPlays < REWARD_MAX_PLAYS && (
+            <div className="sq-noprint" style={{ display: "flex", justifyContent: "center", marginBottom: 16 }}>
+              <button
+                className="sq-playbtn"
+                onClick={() => setShowReward(true)}
+                title={`${REWARD_MAX_PLAYS - rewardPlays} play${REWARD_MAX_PLAYS - rewardPlays === 1 ? "" : "s"} left today`}
+              >
+                <span className="sq-bob" style={{ fontSize: 20 }} aria-hidden="true">🎮</span>
+                Play your reward game!
+              </button>
+            </div>
+          )}
           {tab === "study" && <StudyView kid={kid} day={day} saveDay={saveDay} dayLoading={dayLoading} />}
           {tab === "chores" && (
             <ChoresView chores={chores} choreLog={choreLog} saveChoreLog={saveChoreLog} />
@@ -1542,6 +1721,14 @@ export default function App() {
 
       {showReward && kid && (
         <RewardGameModal grade={kid.grade} kidName={kid.name} onClose={finishReward} />
+      )}
+
+      {showAvatarPicker && kid && (
+        <AvatarPicker
+          kid={kid}
+          onClose={() => setShowAvatarPicker(false)}
+          onSaved={(ks) => { refreshKids(ks); setShowAvatarPicker(false); }}
+        />
       )}
 
       {choreCeleb && !showReward && (
@@ -1574,6 +1761,7 @@ function AuthScreen({ onAuthed, updateBanner, inviteCode = "", onCancelInvite })
   const [pending, setPending] = useState(null); // {email, devLink?, emailConfigured} after signup
   const [needsVerify, setNeedsVerify] = useState(false); // login blocked: unverified
   const [resendMsg, setResendMsg] = useState("");
+  const [resetMsg, setResetMsg] = useState("");
 
   const isEmailish = (v) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v.trim());
   const isAdminLogin = (v) => v.trim().toLowerCase() === "admin";
@@ -1723,6 +1911,26 @@ function AuthScreen({ onAuthed, updateBanner, inviteCode = "", onCancelInvite })
           placeholder="Your password"
           onKeyDown={(e) => mode === "login" && e.key === "Enter" && submit()}
         />
+        {mode === "login" && (
+          <div style={{ textAlign: "right", marginTop: 2 }}>
+            <button
+              onClick={async () => {
+                setErr(""); setResetMsg("");
+                if (!isEmailish(email)) { setErr("Enter your email above first, then tap “Forgot password”."); return; }
+                try {
+                  await api.requestPasswordReset(email.trim());
+                  setResetMsg("If an account exists for that email, we've sent a reset link. Check your inbox.");
+                } catch (e) {
+                  setResetMsg("If an account exists for that email, we've sent a reset link. Check your inbox.");
+                }
+              }}
+              style={{ background: "none", border: "none", color: "#3b7de8", fontWeight: 700, cursor: "pointer", fontFamily: FONT_DISPLAY, fontSize: 13, padding: "2px 0" }}
+            >
+              Forgot password?
+            </button>
+          </div>
+        )}
+        {resetMsg && <div style={{ ...errBox, background: "#eef4fb", color: "#3b5b8e" }}>{resetMsg}</div>}
         {mode === "signup" && (
           <>
             <label style={lbl}>Confirm password</label>
@@ -1814,6 +2022,55 @@ function AuthScreen({ onAuthed, updateBanner, inviteCode = "", onCancelInvite })
 }
 
 /* ===================== EMAIL VERIFICATION LANDING ===================== */
+function ResetPasswordScreen({ token, onDone, onCancel, updateBanner }) {
+  const [pw, setPw] = useState("");
+  const [pw2, setPw2] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const [done, setDone] = useState(false);
+
+  const submit = async () => {
+    setErr("");
+    if (pw.length < 6) return setErr("Password must be at least 6 characters.");
+    if (pw !== pw2) return setErr("Passwords don't match.");
+    setBusy(true);
+    try {
+      const r = await api.resetPassword(token, pw);
+      setDone(true);
+      // r.parent present -> they're now logged in
+      setTimeout(() => onDone(r && r.parent ? r.parent : null), 900);
+    } catch (e) {
+      setErr(e.message || "This reset link is invalid or has expired.");
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div style={{ ...wrap, display: "grid", placeItems: "center", minHeight: "100vh" }}>
+      <style>{css}</style>
+      {updateBanner}
+      <div className="sq-card" style={{ ...panel, maxWidth: 420, width: "100%" }}>
+        <div style={{ fontSize: 40, textAlign: "center" }}>🔑</div>
+        <h1 className="sq-h" style={{ ...h1, textAlign: "center", marginTop: 4 }}>Choose a new password</h1>
+        {done ? (
+          <div style={{ ...errBox, background: "#eefaf0", color: "#2fa84f", textAlign: "center" }}>Password updated! Signing you in…</div>
+        ) : (
+          <>
+            <p style={{ color: "#7a6f8c", textAlign: "center", marginTop: -6 }}>Enter a new password for your StudyQuest account.</p>
+            <input style={input} type="password" value={pw} onChange={(e) => setPw(e.target.value)} placeholder="New password" autoFocus />
+            <input style={input} type="password" value={pw2} onChange={(e) => setPw2(e.target.value)} placeholder="Re-enter new password" onKeyDown={(e) => e.key === "Enter" && submit()} />
+            {err && <div style={errBox}>{err}</div>}
+            <button style={{ ...btnPrimary, width: "100%", opacity: busy ? 0.6 : 1 }} disabled={busy} onClick={submit}>{busy ? "Saving…" : "Set new password"}</button>
+            <div style={{ textAlign: "center", marginTop: 12 }}>
+              <button onClick={onCancel} style={{ background: "none", border: "none", color: "#9a8fb0", fontWeight: 700, cursor: "pointer", fontFamily: FONT_DISPLAY, fontSize: 13 }}>Cancel</button>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function VerifyScreen({ state, onContinue }) {
   return (
     <div className="sq-root" style={{ ...wrap, minHeight: "100vh", display: "grid", placeItems: "center" }}>
@@ -1959,21 +2216,84 @@ function Header({ parent, familyMode, familyName, kids, activeKid, setActiveKid,
       </div>
       <div style={{ flex: 1 }} />
       {!parentMode && kids.length > 0 && (
-        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-          {kids.map((k) => (
-            <button
-              key={k.id}
-              onClick={() => setActiveKid(k.id)}
-              style={{
-                ...chip,
-                background: k.id === activeKid ? "#4a3f5e" : "#fff",
-                color: k.id === activeKid ? "#fff" : "#4a3f5e",
-                borderColor: k.id === activeKid ? "#4a3f5e" : "#e3dcec",
-              }}
-            >
-              {k.name} · G{k.grade}
-            </button>
-          ))}
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "flex-end" }}>
+          {kids.map((k) => {
+            const selected = k.id === activeKid;
+            const av = kidAvatar(k);
+            return (
+              <button
+                key={k.id}
+                onClick={() => setActiveKid(k.id)}
+                aria-pressed={selected}
+                title={selected ? `${k.name} (playing now)` : `Switch to ${k.name}`}
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  alignItems: "center",
+                  gap: 3,
+                  border: "none",
+                  background: "transparent",
+                  cursor: "pointer",
+                  padding: 0,
+                }}
+              >
+                <div
+                  style={{
+                    position: "relative",
+                    width: selected ? 56 : 44,
+                    height: selected ? 56 : 44,
+                    borderRadius: "50%",
+                    background: av.color,
+                    color: "#fff",
+                    display: "grid",
+                    placeItems: "center",
+                    fontFamily: FONT_DISPLAY,
+                    fontWeight: 800,
+                    fontSize: selected ? 24 : 19,
+                    boxShadow: selected ? `0 0 0 4px #fff, 0 0 0 7px ${av.color}` : "0 2px 6px rgba(74,63,94,.2)",
+                    opacity: selected ? 1 : 0.6,
+                    transition: "all .15s ease",
+                  }}
+                >
+                  {av.emoji}
+                  {selected && (
+                    <span
+                      style={{
+                        position: "absolute",
+                        bottom: -2,
+                        right: -2,
+                        width: 20,
+                        height: 20,
+                        borderRadius: "50%",
+                        background: "#2fa84f",
+                        color: "#fff",
+                        fontSize: 12,
+                        display: "grid",
+                        placeItems: "center",
+                        border: "2px solid #fff",
+                      }}
+                    >
+                      ✓
+                    </span>
+                  )}
+                </div>
+                <span
+                  className="sq-h"
+                  style={{
+                    fontSize: selected ? 14 : 12,
+                    fontWeight: 800,
+                    color: selected ? av.color : "#9a8fb0",
+                    maxWidth: 72,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  {k.name}
+                </span>
+              </button>
+            );
+          })}
         </div>
       )}
       {displayName && (
@@ -2021,6 +2341,420 @@ function TabBar({ tab, setTab }) {
           {label}
         </button>
       ))}
+    </div>
+  );
+}
+
+/* --------------------------- onboarding wizard -------------------------- */
+function OnboardingWizard({ refreshKids, setActiveKid, familyName, onRenamed }) {
+  const [step, setStep] = useState(0);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+
+  // collected settings
+  const [famName, setFamName] = useState(familyName || "");
+  const [name, setName] = useState("");
+  const [grade, setGrade] = useState(1);
+  const [selected, setSelected] = useState(() => {
+    // default: all built-in categories on
+    const s = {};
+    for (const subj of SUBJECTS) s[subj.key] = [...(SUBJECT_CATEGORIES[subj.key] || [])];
+    return s;
+  });
+  const [counts, setCounts] = useState(() => {
+    const c = {};
+    for (const subj of SUBJECTS) c[subj.key] = 10;
+    return c;
+  });
+  const [chores, setChores] = useState(() => DEFAULT_CHORES.map((c) => ({ id: uid(), title: c.title, days: c.days.slice() })));
+  const [newChore, setNewChore] = useState("");
+
+  const toggleCat = (subj, cat) => {
+    setSelected((prev) => {
+      const cur = new Set(prev[subj] || []);
+      cur.has(cat) ? cur.delete(cat) : cur.add(cat);
+      return { ...prev, [subj]: [...cur] };
+    });
+  };
+  const setCount = (subj, v) => {
+    let n = parseInt(v, 10);
+    if (!Number.isFinite(n)) n = 0;
+    n = Math.max(0, Math.min(20, n));
+    setCounts((c) => ({ ...c, [subj]: n }));
+  };
+
+  const next = () => setStep((s) => s + 1);
+  const back = () => setStep((s) => Math.max(0, s - 1));
+
+  // Final step: create the kid, save everything, generate questions.
+  // Save the current child's settings. On success, remember the created id and
+  // move to the "add another?" step (step 4). The hand-off to the app happens
+  // only when the parent says they're done.
+  const [addedCount, setAddedCount] = useState(0);
+  const [firstKidId, setFirstKidId] = useState(null);
+  const [lastKidName, setLastKidName] = useState("");
+
+  const resetForNextKid = () => {
+    setName("");
+    setGrade(1);
+    const s = {};
+    for (const subj of SUBJECTS) s[subj.key] = [...(SUBJECT_CATEGORIES[subj.key] || [])];
+    setSelected(s);
+    const c = {};
+    for (const subj of SUBJECTS) c[subj.key] = 10;
+    setCounts(c);
+    setChores(DEFAULT_CHORES.map((ch) => ({ id: uid(), title: ch.title, days: ch.days.slice() })));
+    setNewChore("");
+    setErr("");
+  };
+
+  const saveCurrentKid = async () => {
+    setErr("");
+    if (!name.trim()) {
+      setErr("Please enter the child's name.");
+      setStep(1);
+      return;
+    }
+    setBusy(true);
+    try {
+      if (famName.trim() && famName.trim() !== (familyName || "")) {
+        try {
+          const r = await api.familyRename(famName.trim());
+          if (onRenamed) onRenamed((r && r.name) || famName.trim());
+        } catch {}
+      }
+      const ks = await api.createKid(name.trim(), Number(grade));
+      const created = ks[ks.length - 1];
+      if (!created) throw new Error("Could not create the child profile.");
+      await api.updateKid(created.id, { categories: { selected, custom: {} }, counts });
+      await store.set(`chores:${created.id}`, chores);
+      if (!firstKidId) setFirstKidId(created.id);
+      setLastKidName(name.trim());
+      setAddedCount((n) => n + 1);
+      setBusy(false);
+      setStep(4); // "add another?" screen
+    } catch (e) {
+      setErr(e.message || "Something went wrong setting up. Please try again.");
+      setBusy(false);
+    }
+  };
+
+  // Done adding kids — hand off to the app (selecting a kid generates questions).
+  const finishAll = async () => {
+    setBusy(true);
+    try {
+      await refreshKids();
+      if (firstKidId) setActiveKid(firstKidId);
+    } catch (e) {
+      setErr(e.message || "Something went wrong. Please try again.");
+      setBusy(false);
+    }
+  };
+
+  const card = { ...panel, maxWidth: 600, margin: "0 auto" };
+
+  // ---------- Step 0: Welcome ----------
+  if (step === 0) {
+    return (
+      <div className="sq-card" style={card}>
+        <div style={{ textAlign: "center" }}>
+          <div style={{ fontSize: 52 }}>🎓</div>
+          <h1 className="sq-h" style={{ ...h1, marginBottom: 4 }}>Welcome to StudyQuest!</h1>
+          <p style={{ color: "#7a6f8c", marginTop: 0 }}>Let's set things up. Here's everything StudyQuest can do:</p>
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 10, margin: "16px 0" }}>
+          {[
+            ["📚", "Daily questions", "A fresh set of questions every day across Math, Reading & Writing, Science, History, and Geography — with instant, kid-friendly grading and gentle hints."],
+            ["🎯", "You choose the topics", "Pick exactly which topics each child practices, and how many questions per subject (0–20). Math includes visual questions like graphs and shapes."],
+            ["🎓", "Grade levels", "Set each child's grade so questions are the right difficulty."],
+            ["🧹", "Chores tracker", "Add chores and choose which days they appear. Kids check them off each day."],
+            ["🎮", "Reward game", "When a child gets everything right and finishes their chores, they unlock a fun mini-game — plus celebration pop-ups."],
+            ["👨‍👩‍👧", "Family & multiple kids", "Add as many kids as you like. Invite another parent with a link. Each child has their own profile and progress."],
+            ["📅", "Progress calendar", "See each child's questions and chores history at a glance."],
+            ["📧", "Email updates", "Optionally get an email when your child finishes their questions or all their chores."],
+          ].map(([emoji, title, desc]) => (
+            <div key={title} style={{ display: "flex", gap: 12, alignItems: "flex-start" }}>
+              <div style={{ fontSize: 24, flexShrink: 0, width: 30, textAlign: "center" }}>{emoji}</div>
+              <div>
+                <div className="sq-h" style={{ fontWeight: 800, color: "#4a3f5e" }}>{title}</div>
+                <div style={{ fontSize: 14, color: "#7a6f8c", lineHeight: 1.4 }}>{desc}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+        <button style={{ ...btnPrimary, width: "100%", fontSize: 17, padding: "14px" }} onClick={next}>Let's get started →</button>
+      </div>
+    );
+  }
+
+  // ---------- Step 1: Add a kid (name + grade) ----------
+  if (step === 1) {
+    return (
+      <div className="sq-card" style={card}>
+        <WizardHeader step={1} total={4} title={addedCount > 0 ? "Add another child" : "Add your first child"} emoji="👧" />
+        {familyName || addedCount > 0 ? null : (
+          <>
+            <label style={lbl}>Family name <span style={{ color: "#9a8fb0", fontWeight: 600 }}>(optional)</span></label>
+            <input style={input} value={famName} onChange={(e) => setFamName(e.target.value)} placeholder="e.g. The Smith Family" maxLength={40} />
+          </>
+        )}
+        <label style={lbl}>Child's name</label>
+        <input style={input} value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Ava" autoFocus onKeyDown={(e) => e.key === "Enter" && name.trim() && next()} />
+        <label style={lbl}>Grade level</label>
+        <p style={{ fontSize: 13, color: "#9a8fb0", margin: "0 0 6px" }}>This sets how hard the questions are.</p>
+        <select style={input} value={grade} onChange={(e) => setGrade(Number(e.target.value))}>
+          {Array.from({ length: 12 }).map((_, i) => <option key={i} value={i + 1}>Grade {i + 1}</option>)}
+        </select>
+        {err && <div style={errBox}>{err}</div>}
+        <div style={{ display: "flex", gap: 10, marginTop: 18 }}>
+          <button style={{ ...btnGhost, flex: 1 }} onClick={() => (addedCount > 0 ? setStep(4) : back())}>← Back</button>
+          <button style={{ ...btnPrimary, flex: 2, marginTop: 0, opacity: name.trim() ? 1 : 0.5 }} disabled={!name.trim()} onClick={next}>Next: pick topics →</button>
+        </div>
+      </div>
+    );
+  }
+
+  // ---------- Step 2: Categories + counts ----------
+  if (step === 2) {
+    return (
+      <div className="sq-card" style={card}>
+        <WizardHeader step={2} total={4} title={`What should ${name || "your child"} practice?`} emoji="🎯" />
+        <p style={{ color: "#7a6f8c", marginTop: -6 }}>Tap topics to turn them on or off, and set how many questions per subject (0 skips it). You can change all of this later.</p>
+        {SUBJECTS.map((subj) => {
+          const cats = SUBJECT_CATEGORIES[subj.key] || [];
+          const sel = new Set(selected[subj.key] || []);
+          return (
+            <div key={subj.key} style={{ padding: "12px 0", borderBottom: "1px solid #f0ecf6" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, flexWrap: "wrap", marginBottom: 8 }}>
+                <h3 className="sq-h" style={{ margin: 0, fontSize: 17, color: subj.color }}>{subj.key}</h3>
+                <label style={{ fontSize: 13, color: "#7a6f8c", fontWeight: 700, display: "inline-flex", alignItems: "center", gap: 6 }}>
+                  Questions/day:
+                  <input type="number" min={0} max={20} value={counts[subj.key] ?? 10} onChange={(e) => setCount(subj.key, e.target.value)} style={{ ...input, margin: 0, width: 64, padding: "6px 8px", textAlign: "center" }} />
+                </label>
+              </div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 8, opacity: (counts[subj.key] ?? 10) === 0 ? 0.4 : 1 }}>
+                {cats.map((cat) => {
+                  const on = sel.has(cat);
+                  return (
+                    <button
+                      key={cat}
+                      onClick={() => toggleCat(subj.key, cat)}
+                      style={{ ...chip, fontSize: 13, padding: "7px 12px", background: on ? subj.color : "#fff", color: on ? "#fff" : "#6a5f7e", borderColor: on ? subj.color : "#e3dcec" }}
+                    >
+                      {on ? "✓ " : ""}{cat}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          );
+        })}
+        <div style={{ display: "flex", gap: 10, marginTop: 18 }}>
+          <button style={{ ...btnGhost, flex: 1 }} onClick={back}>← Back</button>
+          <button style={{ ...btnPrimary, flex: 2, marginTop: 0 }} onClick={next}>Next: chores →</button>
+        </div>
+      </div>
+    );
+  }
+
+  // ---------- Step 3: Chores ----------
+  if (step === 3) {
+    const addChore = () => {
+      if (!newChore.trim()) return;
+      setChores((c) => [...c, { id: uid(), title: newChore.trim(), days: ALL_DAYS.slice() }]);
+      setNewChore("");
+    };
+    const removeChore = (id) => setChores((c) => c.filter((x) => x.id !== id));
+    const toggleDay = (id, dow) =>
+      setChores((c) =>
+        c.map((ch) => {
+          if (ch.id !== id) return ch;
+          const set = new Set(ch.days);
+          set.has(dow) ? set.delete(dow) : set.add(dow);
+          return { ...ch, days: [...set].sort((a, b) => a - b) };
+        })
+      );
+    return (
+      <div className="sq-card" style={card}>
+        <WizardHeader step={3} total={4} title="Set up chores" emoji="🧹" />
+        <p style={{ color: "#7a6f8c", marginTop: -6 }}>We added a few common chores — edit, remove, or add your own. Tap day letters to choose which days each appears. (You can skip this and add chores later.)</p>
+        {chores.map((c) => (
+          <div key={c.id} style={{ padding: "10px 0", borderBottom: "1px solid #f0ecf6" }}>
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <input style={{ ...input, margin: 0, flex: 1 }} value={c.title} onChange={(e) => setChores((arr) => arr.map((x) => (x.id === c.id ? { ...x, title: e.target.value } : x)))} />
+              <button style={{ ...btnGhost, borderColor: "#e0506b", color: "#e0506b" }} onClick={() => removeChore(c.id)}>✕</button>
+            </div>
+            <div style={{ display: "flex", gap: 5, marginTop: 8, flexWrap: "wrap" }}>
+              {WEEKDAYS.map((label, dow) => {
+                const on = c.days.includes(dow);
+                return (
+                  <button key={dow} onClick={() => toggleDay(c.id, dow)} title={label} style={{ width: 34, height: 32, borderRadius: 8, cursor: "pointer", fontWeight: 800, fontSize: 12, fontFamily: FONT_DISPLAY, border: `1.5px solid ${on ? "#4a3f5e" : "#e3dcec"}`, background: on ? "#4a3f5e" : "#fff", color: on ? "#fff" : "#9a8fb0" }}>{label[0]}</button>
+                );
+              })}
+            </div>
+          </div>
+        ))}
+        <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+          <input style={{ ...input, margin: 0 }} value={newChore} onChange={(e) => setNewChore(e.target.value)} placeholder="Add a chore…" onKeyDown={(e) => e.key === "Enter" && addChore()} />
+          <button style={{ ...btnGhost }} onClick={addChore}>+ Add</button>
+        </div>
+        {err && <div style={errBox}>{err}</div>}
+        <div style={{ display: "flex", gap: 10, marginTop: 18 }}>
+          <button style={{ ...btnGhost, flex: 1 }} onClick={back}>← Back</button>
+          <button style={{ ...btnPrimary, flex: 2, marginTop: 0, opacity: busy ? 0.6 : 1 }} disabled={busy} onClick={saveCurrentKid}>
+            {busy ? "Saving…" : `✨ Save ${name.trim() || "child"}`}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // ---------- Step 4: Saved — add another child? ----------
+  if (step === 4) {
+    return (
+      <div className="sq-card" style={card}>
+        <div style={{ textAlign: "center" }}>
+          <div style={{ fontSize: 52 }}>🎉</div>
+          <h2 className="sq-h" style={{ ...h2, marginBottom: 4 }}>{lastKidName} is all set!</h2>
+          <p style={{ color: "#7a6f8c", marginTop: 0 }}>
+            {addedCount === 1 ? "1 child added." : `${addedCount} children added.`} Would you like to add another child?
+          </p>
+        </div>
+        {err && <div style={errBox}>{err}</div>}
+        <div style={{ display: "flex", flexDirection: "column", gap: 10, marginTop: 16 }}>
+          <button
+            style={{ ...btnGhost, width: "100%", padding: "14px", fontSize: 16 }}
+            disabled={busy}
+            onClick={() => { resetForNextKid(); setStep(1); }}
+          >
+            ➕ Add another child
+          </button>
+          <button
+            style={{ ...btnPrimary, width: "100%", marginTop: 0, padding: "14px", fontSize: 17, opacity: busy ? 0.6 : 1 }}
+            disabled={busy}
+            onClick={finishAll}
+          >
+            {busy ? "Creating questions…" : "✅ All done — start StudyQuest"}
+          </button>
+        </div>
+        {busy && <p style={{ textAlign: "center", color: "#9a8fb0", fontSize: 13, marginTop: 10 }}>Generating the first set of questions — this can take a few seconds.</p>}
+      </div>
+    );
+  }
+
+  return null;
+}
+
+function WizardHeader({ step, total, title, emoji }) {
+  return (
+    <div style={{ marginBottom: 12 }}>
+      <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
+        {Array.from({ length: total }).map((_, i) => (
+          <div key={i} style={{ flex: 1, height: 6, borderRadius: 3, background: i < step ? "#4a3f5e" : "#e8e2f1" }} />
+        ))}
+      </div>
+      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <span style={{ fontSize: 30 }}>{emoji}</span>
+        <h2 className="sq-h" style={{ ...h2, margin: 0 }}>{title}</h2>
+      </div>
+      <div style={{ fontSize: 12, color: "#9a8fb0", fontWeight: 700, marginTop: 4 }}>Step {step} of {total}</div>
+    </div>
+  );
+}
+
+/* ----------------------------- avatar picker ---------------------------- */
+function AvatarPicker({ kid, onClose, onSaved }) {
+  const cur = kidAvatar(kid);
+  const [icon, setIcon] = useState(cur.emoji);
+  const [color, setColor] = useState(cur.color);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+
+  const save = async () => {
+    setBusy(true);
+    setErr("");
+    try {
+      const ks = await api.setKidAvatar(kid.id, icon, color);
+      onSaved(ks);
+    } catch (e) {
+      setErr(e.message || "Could not save. Try again.");
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div
+      onClick={onClose}
+      style={{ position: "fixed", inset: 0, background: "rgba(40,30,55,.55)", display: "grid", placeItems: "center", zIndex: 100, padding: 16 }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        className="sq-card"
+        style={{ background: "#fff", borderRadius: 22, padding: 22, maxWidth: 460, width: "100%", maxHeight: "90vh", overflowY: "auto", boxShadow: "0 20px 60px rgba(0,0,0,.3)" }}
+      >
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+          <h2 className="sq-h" style={{ ...h2, margin: 0 }}>Make it yours!</h2>
+          <button onClick={onClose} aria-label="Close" style={{ width: 34, height: 34, borderRadius: 10, border: "none", background: "#f0ecf6", color: "#6a5f7e", fontSize: 18, fontWeight: 800, cursor: "pointer" }}>✕</button>
+        </div>
+
+        {/* Live preview */}
+        <div style={{ display: "flex", justifyContent: "center", marginBottom: 16 }}>
+          <div style={{ width: 90, height: 90, borderRadius: "50%", background: color, display: "grid", placeItems: "center", fontSize: 50, boxShadow: `0 0 0 5px #fff, 0 0 0 9px ${color}` }}>
+            {icon}
+          </div>
+        </div>
+
+        <div style={{ ...lbl, marginTop: 0 }}>Pick an icon</div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(46px, 1fr))", gap: 6, maxHeight: 230, overflowY: "auto", padding: 4, background: "#faf8fd", borderRadius: 12, border: "1px solid #efeaf7" }}>
+          {AVATAR_ICONS.map((ic) => (
+            <button
+              key={ic}
+              onClick={() => setIcon(ic)}
+              style={{
+                aspectRatio: "1",
+                fontSize: 26,
+                borderRadius: 10,
+                cursor: "pointer",
+                border: icon === ic ? `2.5px solid ${color}` : "2.5px solid transparent",
+                background: icon === ic ? "#fff" : "transparent",
+                boxShadow: icon === ic ? "0 2px 8px rgba(74,63,94,.15)" : "none",
+              }}
+            >
+              {ic}
+            </button>
+          ))}
+        </div>
+
+        <div style={lbl}>Pick a color</div>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
+          {AVATAR_COLORS.map((c) => (
+            <button
+              key={c}
+              onClick={() => setColor(c)}
+              aria-label={c}
+              style={{
+                width: 38,
+                height: 38,
+                borderRadius: "50%",
+                background: c,
+                cursor: "pointer",
+                border: color === c ? "3px solid #2b2438" : "3px solid #fff",
+                boxShadow: "0 1px 4px rgba(0,0,0,.2)",
+              }}
+            >
+              {color === c ? <span style={{ color: "#fff", fontWeight: 900 }}>✓</span> : ""}
+            </button>
+          ))}
+        </div>
+
+        {err && <div style={errBox}>{err}</div>}
+        <div style={{ display: "flex", gap: 10, marginTop: 20 }}>
+          <button style={{ ...btnGhost, flex: 1 }} onClick={onClose}>Cancel</button>
+          <button style={{ ...btnPrimary, flex: 2, marginTop: 0, opacity: busy ? 0.6 : 1 }} disabled={busy} onClick={save}>
+            {busy ? "Saving…" : "💾 Save my look"}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -3150,6 +3884,7 @@ function ParentPanel({ parent, setParent, kids, refreshKids, activeKid, setActiv
     ["chores", "🧹 Chores Setup"],
     ["answers", "🔑 Answer Keys"],
     ["family", "👨‍👩‍👧 Family"],
+    ["notifications", "🔔 Notifications"],
     ["account", "⚙️ Account"],
     ...(parent && parent.isAdmin ? [["admin", "🛡️ Admin"], ["logs", "📋 Logs"]] : []),
   ];
@@ -3182,6 +3917,7 @@ function ParentPanel({ parent, setParent, kids, refreshKids, activeKid, setActiv
       {section === "chores" && <ChoresManager kids={kids} activeKid={activeKid} setActiveKid={setActiveKid} />}
       {section === "answers" && <AnswerKey kids={kids} date={date} />}
       {section === "family" && <FamilyManager onRenamed={onRenamed} />}
+      {section === "notifications" && <NotificationsManager />}
       {section === "account" && <AccountManager parent={parent} setParent={setParent} />}
       {section === "admin" && parent && parent.isAdmin && <AdminPanel meUsername={parent.username} />}
       {section === "logs" && parent && parent.isAdmin && <LogViewer />}
@@ -3190,6 +3926,119 @@ function ParentPanel({ parent, setParent, kids, refreshKids, activeKid, setActiv
 }
 
 /* ------------------------------ family manager -------------------------- */
+/* ------------------------- notifications manager ------------------------ */
+function NotificationsManager() {
+  const [questions, setQuestions] = useState(true);
+  const [chores, setChores] = useState(true);
+  const [emails, setEmails] = useState([]); // extra recipient emails
+  const [newEmail, setNewEmail] = useState("");
+  const [loaded, setLoaded] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [err, setErr] = useState("");
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const s = await api.notifySettings();
+        setQuestions(s.questions !== false);
+        setChores(s.chores !== false);
+        setEmails(Array.isArray(s.extraEmails) ? s.extraEmails : []);
+      } catch (e) {
+        setErr(e.message || "Could not load notification settings.");
+      } finally {
+        setLoaded(true);
+      }
+    })();
+  }, []);
+
+  const isEmailish = (v) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(v).trim());
+
+  const addEmail = () => {
+    setErr("");
+    const e = newEmail.trim().toLowerCase();
+    if (!isEmailish(e)) { setErr("Enter a valid email address."); return; }
+    if (emails.includes(e)) { setErr("That email is already on the list."); return; }
+    if (emails.length >= 5) { setErr("You can add up to 5 emails."); return; }
+    setEmails((arr) => [...arr, e]);
+    setNewEmail("");
+    setSaved(false);
+  };
+  const removeEmail = (e) => { setEmails((arr) => arr.filter((x) => x !== e)); setSaved(false); };
+
+  const save = async () => {
+    setBusy(true);
+    setErr("");
+    setSaved(false);
+    try {
+      await api.saveNotifySettings({ questions, chores, extraEmails: emails });
+      setSaved(true);
+    } catch (e) {
+      setErr(e.message || "Could not save settings.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (!loaded) return <div className="sq-card" style={panel}><p style={{ color: "#7a6f8c" }}>Loading…</p></div>;
+
+  const Toggle = ({ on, set, label, desc }) => (
+    <button
+      onClick={() => { set(!on); setSaved(false); }}
+      style={{ display: "flex", alignItems: "center", gap: 12, width: "100%", textAlign: "left", background: "#faf8fd", border: "1px solid #efeaf7", borderRadius: 12, padding: "12px 14px", cursor: "pointer", marginBottom: 10 }}
+    >
+      <span style={{ width: 46, height: 26, borderRadius: 999, background: on ? "#2fa84f" : "#cfc7da", position: "relative", flexShrink: 0, transition: "background .15s" }}>
+        <span style={{ position: "absolute", top: 3, left: on ? 23 : 3, width: 20, height: 20, borderRadius: "50%", background: "#fff", transition: "left .15s", boxShadow: "0 1px 3px rgba(0,0,0,.2)" }} />
+      </span>
+      <span>
+        <span className="sq-h" style={{ fontWeight: 800, color: "#4a3f5e", display: "block" }}>{label}</span>
+        <span style={{ fontSize: 13, color: "#7a6f8c" }}>{desc}</span>
+      </span>
+    </button>
+  );
+
+  return (
+    <div className="sq-card" style={panel}>
+      <h2 className="sq-h" style={{ ...h2, marginTop: 0 }}>🔔 Email Notifications</h2>
+      <p style={{ color: "#7a6f8c", marginTop: -8 }}>Choose which completion emails to send, and add extra people who should get them. (Email must be configured for these to send.)</p>
+      {err && <div style={errBox}>{err}</div>}
+
+      <Toggle on={questions} set={setQuestions} label="📚 Questions finished" desc="Email when a child has answered all of their questions for the day." />
+      <Toggle on={chores} set={setChores} label="🧹 Chores finished" desc="Email when a child has completed all of their chores for the day." />
+
+      <div style={{ marginTop: 18 }}>
+        <div style={lbl}>Extra notification emails <span style={{ color: "#9a8fb0", fontWeight: 600 }}>(up to 5)</span></div>
+        <p style={{ fontSize: 13, color: "#7a6f8c", margin: "0 0 8px" }}>
+          These addresses also receive the emails you enabled above. They don't need to verify — make sure they're typed correctly. All logged-in parents in your family always receive them too.
+        </p>
+        {emails.length > 0 && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 10 }}>
+            {emails.map((e) => (
+              <div key={e} style={{ display: "flex", alignItems: "center", gap: 8, background: "#f6f3fb", borderRadius: 10, padding: "8px 12px" }}>
+                <span style={{ flex: 1, wordBreak: "break-all", fontWeight: 700, color: "#4a3f5e" }}>{e}</span>
+                <button style={{ ...miniLink, color: "#e0506b", textDecoration: "none" }} onClick={() => removeEmail(e)}>Remove</button>
+              </div>
+            ))}
+          </div>
+        )}
+        {emails.length < 5 ? (
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <input style={{ ...input, margin: 0, maxWidth: 280 }} type="email" value={newEmail} onChange={(e) => setNewEmail(e.target.value)} placeholder="grandma@example.com" autoCapitalize="none" onKeyDown={(e) => e.key === "Enter" && addEmail()} />
+            <button style={btnGhost} onClick={addEmail}>+ Add email</button>
+          </div>
+        ) : (
+          <p style={{ fontSize: 13, color: "#9a8fb0" }}>You've reached the limit of 5 extra emails.</p>
+        )}
+      </div>
+
+      <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 20 }}>
+        <button style={{ ...btnPrimary, marginTop: 0, opacity: busy ? 0.6 : 1 }} disabled={busy} onClick={save}>{busy ? "Saving…" : "Save notification settings"}</button>
+        {saved && <span style={{ color: "#2fa84f", fontWeight: 700 }}>✓ Saved</span>}
+      </div>
+    </div>
+  );
+}
+
 function FamilyManager({ onRenamed }) {
   const [info, setInfo] = useState(null); // { code, name, members }
   const [err, setErr] = useState("");
@@ -3474,95 +4323,144 @@ function AccountManager({ parent, setParent }) {
 
 /* ------------------------------ admin panel ----------------------------- */
 function AdminPanel({ meUsername }) {
-  const [users, setUsers] = useState(null);
+  const [data, setData] = useState(null); // { users, families }
   const [err, setErr] = useState("");
-  const [resetFor, setResetFor] = useState(null); // username being reset
-  const [newPw, setNewPw] = useState("");
-  const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
+  const [busy, setBusy] = useState("");
+  const [addFor, setAddFor] = useState(null); // familyId we're adding a user to
+  const [addEmail, setAddEmail] = useState("");
 
   const load = async () => {
     setErr("");
     try {
-      setUsers(await api.adminListUsers());
+      const r = await api.adminListUsers();
+      // adminListUsers returns the array for back-compat; fetch raw for families
+      const raw = await apiRequest("admin-list-users");
+      setData({ users: (raw && raw.users) || r || [], families: (raw && raw.families) || [] });
     } catch (e) {
       setErr(e.message || "Could not load accounts.");
-      setUsers([]);
+      setData({ users: [], families: [] });
     }
   };
-  useEffect(() => {
-    load();
-  }, []);
+  useEffect(() => { load(); }, []);
 
-  const doReset = async (email) => {
-    setMsg("");
-    setErr("");
-    if (newPw.length < 6) return setErr("New password must be at least 6 characters.");
-    setBusy(true);
+  const sendReset = async (email) => {
+    setMsg(""); setErr(""); setBusy("reset:" + email);
     try {
-      await api.adminResetPassword(email, newPw);
-      setMsg(`Password reset for "${email}". Share the new password with them; they can change it after logging in.`);
-      setResetFor(null);
-      setNewPw("");
+      const r = await api.adminSendReset(email);
+      setMsg(r && r.emailConfigured === false
+        ? `Email isn't configured, so no message was sent. (Set RESEND_API_KEY / FROM_EMAIL.)`
+        : `Sent a password-reset link to ${email}.`);
     } catch (e) {
-      setErr(e.message || "Could not reset password.");
-    } finally {
-      setBusy(false);
-    }
+      setErr(e.message || "Could not send reset email.");
+    } finally { setBusy(""); }
   };
+
+  const del = async (u) => {
+    if (!confirm(`Delete ${u.email}? This removes their login. If they're the last parent in their family, that family and its kids will also be deleted. This can't be undone.`)) return;
+    setMsg(""); setErr(""); setBusy("del:" + u.id);
+    try {
+      await api.adminDeleteUser(u.id);
+      setMsg(`Deleted ${u.email}.`);
+      await load();
+    } catch (e) {
+      setErr(e.message || "Could not delete user.");
+    } finally { setBusy(""); }
+  };
+
+  const addUser = async (familyId) => {
+    setMsg(""); setErr("");
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(addEmail.trim())) { setErr("Enter a valid email address."); return; }
+    setBusy("add:" + familyId);
+    try {
+      const r = await api.adminCreateUser(addEmail.trim(), familyId);
+      setMsg(r && r.emailConfigured === false
+        ? `Created ${addEmail.trim()}. Email isn't configured, so they couldn't be emailed a set-password link.`
+        : `Created ${addEmail.trim()} and emailed them a link to set their password.`);
+      setAddEmail(""); setAddFor(null);
+      await load();
+    } catch (e) {
+      setErr(e.message || "Could not add user.");
+    } finally { setBusy(""); }
+  };
+
+  if (data === null) return <div className="sq-card" style={panel}><p style={{ color: "#7a6f8c" }}>Loading accounts…</p></div>;
+
+  // group users by family
+  const byFamily = {};
+  for (const u of data.users) {
+    const key = u.isAdmin ? "__admin__" : (u.familyId || "__none__");
+    (byFamily[key] = byFamily[key] || []).push(u);
+  }
+  const familyOrder = data.families.slice().sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id));
+
+  const UserRow = (u) => (
+    <div key={u.id || u.email} style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", padding: "8px 0", borderBottom: "1px solid #f5f1fa" }}>
+      <span style={{ fontWeight: 700, wordBreak: "break-all" }}>
+        {u.email}
+        {u.isAdmin && <span style={{ marginLeft: 6, fontSize: 11, color: "#9b4dca", fontWeight: 800 }}>ADMIN</span>}
+        {!u.isAdmin && !u.verified && <span style={{ marginLeft: 6, fontSize: 11, color: "#b8702a", fontWeight: 800 }}>unverified</span>}
+      </span>
+      <div style={{ flex: 1 }} />
+      {!u.isAdmin && (
+        <>
+          <button style={{ ...miniLink, color: "#3b7de8", textDecoration: "none" }} disabled={!!busy} onClick={() => sendReset(u.email)}>
+            {busy === "reset:" + u.email ? "Sending…" : "✉️ Send reset link"}
+          </button>
+          <button style={{ ...miniLink, color: "#e0506b", textDecoration: "none" }} disabled={!!busy} onClick={() => del(u)}>
+            {busy === "del:" + u.id ? "Deleting…" : "🗑️ Delete"}
+          </button>
+        </>
+      )}
+    </div>
+  );
 
   return (
     <div className="sq-card" style={panel}>
-      <h2 className="sq-h" style={{ ...h2, marginTop: 0 }}>🛡️ Admin · Accounts</h2>
+      <h2 className="sq-h" style={{ ...h2, marginTop: 0 }}>🛡️ Admin · Users by Family</h2>
       <p style={{ color: "#7a6f8c", marginTop: -8 }}>
-        Reset a parent's password if they're locked out. You can't see existing passwords — only set a new one.
+        Add or remove parents per family. For security, you can't set passwords directly — use “Send reset link” (or adding a user emails them a set-password link). Passwords are only ever set by the user from their emailed link.
       </p>
       {err && <div style={errBox}>{err}</div>}
       {msg && <div style={{ ...errBox, background: "#eefaf0", color: "#2fa84f" }}>{msg}</div>}
 
-      {users === null ? (
-        <p style={{ color: "#7a6f8c" }}>Loading accounts…</p>
-      ) : users.length === 0 ? (
-        <p style={{ color: "#7a6f8c" }}>No accounts yet.</p>
-      ) : (
-        users.map((u) => (
-          <div key={u.email} style={{ padding: "12px 0", borderBottom: "1px solid #f0ecf6" }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-              <span style={{ fontWeight: 800, fontFamily: FONT_DISPLAY, wordBreak: "break-all" }}>
-                {u.email}
-                {u.isAdmin && <span style={{ marginLeft: 6, fontSize: 12, color: "#9b4dca", fontWeight: 800 }}>· ADMIN</span>}
-                {!u.isAdmin && !u.verified && <span style={{ marginLeft: 6, fontSize: 12, color: "#b8702a", fontWeight: 800 }}>· unverified</span>}
-              </span>
-              <span style={{ color: "#9a8fb0", fontSize: 13 }}>
-                {u.kidCount} kid{u.kidCount === 1 ? "" : "s"}
-              </span>
-              <div style={{ flex: 1 }} />
-              {resetFor === u.email ? null : (
-                <button style={btnGhost} onClick={() => { setResetFor(u.email); setNewPw(""); setMsg(""); setErr(""); }}>
-                  Reset password
-                </button>
-              )}
-            </div>
-            {resetFor === u.email && (
-              <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap", alignItems: "center" }}>
-                <input
-                  style={{ ...input, margin: 0, maxWidth: 240 }}
-                  type="text"
-                  value={newPw}
-                  onChange={(e) => setNewPw(e.target.value)}
-                  placeholder="New password (min 6)"
-                  onKeyDown={(e) => e.key === "Enter" && doReset(u.email)}
-                  autoFocus
-                />
-                <button style={{ ...btnPrimary, marginTop: 0, opacity: busy ? 0.6 : 1 }} disabled={busy} onClick={() => doReset(u.email)}>
-                  {busy ? "Saving…" : "Set password"}
-                </button>
-                <button style={btnGhost} onClick={() => { setResetFor(null); setNewPw(""); }}>Cancel</button>
+      {/* Admin account */}
+      {byFamily["__admin__"] && (
+        <div style={{ marginTop: 8, marginBottom: 16 }}>
+          <div style={{ ...lbl, marginTop: 0, color: "#9b4dca" }}>🛡️ Admin account</div>
+          {byFamily["__admin__"].map(UserRow)}
+        </div>
+      )}
+
+      {/* Each family */}
+      {familyOrder.length === 0 && <p style={{ color: "#9a8fb0" }}>No families yet.</p>}
+      {familyOrder.map((fam) => {
+        const members = byFamily[fam.id] || [];
+        return (
+          <div key={fam.id} style={{ marginBottom: 18, padding: 14, background: "#faf8fd", borderRadius: 14, border: "1px solid #efeaf7" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+              <div className="sq-h" style={{ fontWeight: 800, color: "#4a3f5e" }}>
+                {fam.name || "(unnamed family)"} <span style={{ fontSize: 12, color: "#9a8fb0", fontWeight: 700 }}>· {members.length} parent{members.length === 1 ? "" : "s"}</span>
               </div>
+              <code style={{ fontSize: 12, color: "#7a6f8c", background: "#fff", padding: "3px 8px", borderRadius: 6 }}>{fam.code}</code>
+            </div>
+            {members.length === 0 ? (
+              <p style={{ color: "#c0455c", fontSize: 13, margin: "8px 0 0" }}>No parents (orphaned family).</p>
+            ) : (
+              <div style={{ marginTop: 6 }}>{members.map(UserRow)}</div>
+            )}
+            {addFor === fam.id ? (
+              <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap", alignItems: "center" }}>
+                <input style={{ ...input, margin: 0, maxWidth: 240 }} type="email" value={addEmail} onChange={(e) => setAddEmail(e.target.value)} placeholder="parent@example.com" autoFocus autoCapitalize="none" onKeyDown={(e) => e.key === "Enter" && addUser(fam.id)} />
+                <button style={{ ...btnPrimary, marginTop: 0, opacity: busy ? 0.6 : 1 }} disabled={!!busy} onClick={() => addUser(fam.id)}>{busy === "add:" + fam.id ? "Adding…" : "Add & email link"}</button>
+                <button style={btnGhost} onClick={() => { setAddFor(null); setAddEmail(""); }}>Cancel</button>
+              </div>
+            ) : (
+              <button style={{ ...btnGhost, marginTop: 10 }} onClick={() => { setAddFor(fam.id); setAddEmail(""); setMsg(""); setErr(""); }}>+ Add parent to this family</button>
             )}
           </div>
-        ))
-      )}
+        );
+      })}
     </div>
   );
 }

@@ -145,6 +145,10 @@ async function routeAction(action, request, body, requestId) {
         return await handleVerifyEmail(body);
       case "resend-verification":
         return await handleResendVerification(body);
+      case "request-password-reset":
+        return await handleRequestPasswordReset(body);
+      case "reset-password":
+        return await handleResetPassword(body);
       case "family-access":
         return await handleFamilyAccess(body);
       case "admin-status":
@@ -183,12 +187,18 @@ async function routeAction(action, request, body, requestId) {
         return await withParent(request, (auth) => handleFamilyJoinPreview(auth, body));
       case "family-rename":
         return await withParent(request, (auth) => handleFamilyRename(auth, body));
+      case "notify-settings":
+        return await withParent(request, (auth) => handleNotifySettings(auth));
+      case "notify-settings-save":
+        return await withParent(request, (auth) => handleNotifySettingsSave(auth, body));
       case "family-regen-code":
         return await withParent(request, (auth) => handleFamilyRegenCode(auth));
       case "kid-create":
         return await withParent(request, (auth) => handleKidCreate(auth, body));
       case "kid-update":
         return await withParent(request, (auth) => handleKidUpdate(auth, body));
+      case "kid-avatar":
+        return await withAuthAny(request, (auth) => handleKidAvatar(auth, body));
       case "kid-delete":
         return await withParent(request, (auth) => handleKidDelete(auth, body));
 
@@ -197,6 +207,12 @@ async function routeAction(action, request, body, requestId) {
         return await withAdmin(request, () => handleAdminListUsers());
       case "admin-reset-password":
         return await withAdmin(request, () => handleAdminResetPassword(body));
+      case "admin-create-user":
+        return await withAdmin(request, (auth) => handleAdminCreateUser(auth, body));
+      case "admin-delete-user":
+        return await withAdmin(request, (auth) => handleAdminDeleteUser(auth, body));
+      case "admin-send-reset":
+        return await withAdmin(request, (auth) => handleAdminSendReset(auth, body));
       case "admin-logs":
         return await withAdmin(request, () => handleAdminLogs(body));
       case "admin-log-clear":
@@ -555,6 +571,50 @@ async function handleFamilyRename(auth, body) {
   return json({ ok: true, name }, 200);
 }
 
+// Notification settings live on the family record: which completion emails are
+// on, and any extra recipient emails (assumed valid; no verification).
+async function handleNotifySettings(auth) {
+  const store = db();
+  const fam = (await store.get(`family:${auth.fid}`, { type: "json" })) || {};
+  const cfg = fam.notify || {};
+  return json(
+    {
+      questions: cfg.questions !== false,
+      chores: cfg.chores !== false,
+      extraEmails: Array.isArray(cfg.extraEmails) ? cfg.extraEmails : [],
+    },
+    200
+  );
+}
+
+async function handleNotifySettingsSave(auth, body) {
+  const store = db();
+  const fam = (await store.get(`family:${auth.fid}`, { type: "json" })) || { id: auth.fid };
+  fam.id = auth.fid;
+
+  // Clean + de-duplicate extra emails, cap at 5. Invalid ones are dropped.
+  const seen = new Set();
+  const extras = [];
+  const raw = Array.isArray(body.extraEmails) ? body.extraEmails : [];
+  for (const e of raw) {
+    const em = normEmail(e);
+    if (em && isEmail(em) && !seen.has(em)) {
+      seen.add(em);
+      extras.push(em);
+      if (extras.length >= 5) break;
+    }
+  }
+
+  fam.notify = {
+    questions: body.questions !== false,
+    chores: body.chores !== false,
+    extraEmails: extras,
+  };
+  await store.setJSON(`family:${auth.fid}`, fam);
+  logEvent("info", "notify_settings", "Notification settings updated", { fid: auth.fid }, { questions: fam.notify.questions, chores: fam.notify.chores, extraCount: extras.length });
+  return json({ ok: true, ...fam.notify }, 200);
+}
+
 // Preview what joining a family by code would do, so the UI can confirm before
 // any deletion. Reports the target family's name, whether the caller is already
 // a member, and — if joining would leave their current family empty — how many
@@ -730,6 +790,16 @@ async function handleAdminInit(body) {
 // List every parent account (admin view). Never returns password hashes.
 async function handleAdminListUsers() {
   const store = db();
+  // map family ids to names + codes
+  const famMap = {};
+  try {
+    const { blobs: fb } = await store.list({ prefix: "family:" });
+    for (const b of fb) {
+      const fam = await store.get(b.key, { type: "json" });
+      if (fam && fam.id) famMap[fam.id] = { name: fam.name || "", code: fam.code || "" };
+    }
+  } catch {}
+
   const { blobs } = await store.list({ prefix: "parent:" });
   const users = [];
   for (const b of blobs) {
@@ -740,10 +810,103 @@ async function handleAdminListUsers() {
       const kids = p.familyId ? await store.get(`kids:${p.familyId}`, { type: "json" }) : null;
       kidCount = Array.isArray(kids) ? kids.length : 0;
     } catch {}
-    users.push({ email: p.email || p.username, isAdmin: !!p.isAdmin, verified: !!p.verified || !!p.isAdmin, kidCount, createdAt: p.createdAt || 0 });
+    users.push({
+      id: p.id,
+      email: p.email || p.username,
+      isAdmin: !!p.isAdmin,
+      verified: !!p.verified || !!p.isAdmin,
+      kidCount,
+      createdAt: p.createdAt || 0,
+      familyId: p.familyId || "",
+      familyName: (p.familyId && famMap[p.familyId] && famMap[p.familyId].name) || "",
+      familyCode: (p.familyId && famMap[p.familyId] && famMap[p.familyId].code) || "",
+    });
   }
   users.sort((a, b) => (a.isAdmin === b.isAdmin ? a.email.localeCompare(b.email) : a.isAdmin ? -1 : 1));
-  return json({ users }, 200);
+  // also return the list of families so the admin UI can group/add into them
+  const families = Object.keys(famMap).map((id) => ({ id, name: famMap[id].name, code: famMap[id].code }));
+  return json({ users, families }, 200);
+}
+
+// Admin creates a new parent account inside a specific family (by family id or
+// code). The new account is created already-verified and is emailed a link to
+// set their own password (we never set a password directly).
+async function handleAdminCreateUser(auth, body) {
+  requireSecret();
+  const email = normEmail(body.email);
+  if (!isEmail(email)) return json({ error: "Enter a valid email address." }, 400);
+  const store = db();
+  const existing = await store.get(`uname:${email}`);
+  if (existing) return json({ error: "An account with that email already exists." }, 409);
+
+  // Resolve target family by id or code.
+  let familyId = String(body.familyId || "").trim();
+  const code = String(body.familyCode || "").trim().toUpperCase();
+  if (!familyId && code) {
+    familyId = (await store.get(`familycode:${code}`)) || "";
+  }
+  if (!familyId) return json({ error: "Pick a family for the new user." }, 400);
+  const fam = await store.get(`family:${familyId}`, { type: "json" });
+  if (!fam) return json({ error: "That family wasn't found." }, 404);
+
+  // Create the account verified, with a random placeholder password the user
+  // never learns — they set their own via the reset link we email.
+  const pid = uid();
+  const placeholder = crypto.randomBytes(24).toString("hex");
+  const { salt, hash } = hashPassword(placeholder);
+  const parent = { id: pid, email, username: email, salt, hash, familyId, verified: true, isAdmin: false, createdAt: Date.now() };
+  await store.setJSON(`parent:${pid}`, parent);
+  await store.set(`uname:${email}`, pid);
+
+  const sent = await sendPasswordResetEmail(store, parent);
+  logEvent("warn", "admin_create_user", `Admin created user ${email} in family ${familyId}`, { username: email, fid: familyId }, { emailConfigured: sent.configured });
+  const out = { ok: true, email, emailConfigured: sent.configured };
+  if (sent.devLink) out.devLink = sent.devLink;
+  return json(out, 200);
+}
+
+// Admin deletes a parent account. Cannot delete the admin account or yourself.
+// If this was the last member of its family, the family (and its kids/data) is
+// removed too.
+async function handleAdminDeleteUser(auth, body) {
+  const store = db();
+  const targetId = String(body.id || "").trim();
+  const targetEmail = normEmail(body.email);
+  let pid = targetId;
+  if (!pid && targetEmail) pid = (await store.get(`uname:${targetEmail === "admin" ? "admin" : targetEmail}`)) || "";
+  if (!pid) return json({ error: "Which user?" }, 400);
+  if (pid === auth.pid) return json({ error: "You can't delete your own admin account." }, 400);
+
+  const parent = await store.get(`parent:${pid}`, { type: "json" });
+  if (!parent) return json({ error: "Account not found." }, 404);
+  if (parent.isAdmin) return json({ error: "The admin account can't be deleted." }, 403);
+
+  const fid = parent.familyId;
+  await store.delete(`parent:${pid}`);
+  if (parent.email || parent.username) await store.delete(`uname:${parent.email || parent.username}`);
+
+  // Clean up the family if this was its last member.
+  if (fid) await deleteFamilyIfEmpty(store, fid, pid);
+
+  logEvent("warn", "admin_delete_user", `Admin deleted user ${parent.email || parent.username}`, { username: parent.email || parent.username, fid });
+  return json({ ok: true }, 200);
+}
+
+// Admin triggers a password-reset email for a user (the secure way to help a
+// locked-out parent — the admin never sees or sets the password).
+async function handleAdminSendReset(auth, body) {
+  const store = db();
+  const target = normEmail(body.email);
+  if (!isEmail(target)) return json({ error: "Enter a valid email address." }, 400);
+  const pid = await store.get(`uname:${target}`);
+  if (!pid) return json({ error: "No account with that email." }, 404);
+  const parent = await store.get(`parent:${pid}`, { type: "json" });
+  if (!parent || parent.isAdmin) return json({ error: "That account can't be reset this way." }, 400);
+  const sent = await sendPasswordResetEmail(store, parent);
+  logEvent("warn", "admin_send_reset", `Admin sent password-reset email to ${target}`, { username: target, fid: parent.familyId }, { emailConfigured: sent.configured });
+  const out = { ok: true, emailConfigured: sent.configured };
+  if (sent.devLink) out.devLink = sent.devLink;
+  return json(out, 200);
 }
 
 // Admin sets a new password for a target account (by email).
@@ -897,6 +1060,21 @@ async function handleKidCreate(auth, body) {
   return json({ kid: publicKid(kid), kids: kids.map(publicKid) }, 200);
 }
 
+// Kids (in kid mode) may change ONLY their own avatar icon and background color.
+// Sensitive fields (grade, categories, counts) stay parent-only via kid-update.
+async function handleKidAvatar(auth, body) {
+  const id = String(body.id || "");
+  const store = db();
+  const fid = auth.fid;
+  const kids = await getKids(store, fid);
+  const idx = kids.findIndex((k) => k.id === id);
+  if (idx === -1) return json({ error: "Child not found." }, 404);
+  if (typeof body.icon === "string") kids[idx].icon = body.icon.slice(0, 8);
+  if (typeof body.color === "string" && /^#[0-9a-fA-F]{6}$/.test(body.color)) kids[idx].color = body.color;
+  await store.setJSON(`kids:${fid}`, kids);
+  return json({ kids: kids.map(publicKid) }, 200);
+}
+
 async function handleKidUpdate(auth, body) {
   const id = String(body.id || "");
   const store = db();
@@ -911,6 +1089,13 @@ async function handleKidUpdate(auth, body) {
   }
   if (body.counts && typeof body.counts === "object") {
     kids[idx].counts = sanitizeCounts(body.counts);
+  }
+  // Kid avatar customization: an emoji icon and a background color.
+  if (typeof body.icon === "string") {
+    kids[idx].icon = body.icon.slice(0, 8); // an emoji (may be multi-codepoint)
+  }
+  if (typeof body.color === "string") {
+    kids[idx].color = /^#[0-9a-fA-F]{6}$/.test(body.color) ? body.color : kids[idx].color;
   }
   await store.setJSON(`kids:${fid}`, kids);
   return json({ kids: kids.map(publicKid) }, 200);
@@ -1253,6 +1438,12 @@ async function handleNotify(auth, body) {
   const kid = kids.find((k) => k.id === kidId);
   if (!kid) return json({ error: "Not authorized for this child." }, 403);
 
+  // Load this family's notification settings (defaults: both on, no extras).
+  // Short-circuit early if this email type is turned off, before any other work.
+  const fam = (await store.get(`family:${auth.fid}`, { type: "json" })) || {};
+  const notifyCfg = fam.notify || {};
+  if (notifyCfg[type] === false) return json({ sent: 0, disabled: true }, 200);
+
   // Already sent for this kid/day/type?
   const flagKey = `notify:${type}:${kidId}:${date}`;
   try {
@@ -1284,12 +1475,19 @@ async function handleNotify(auth, body) {
     ({ subject, html, text } = buildChoresEmail(kid, todays, log, date));
   }
 
-  // Verified, non-admin parents in this family.
+  // Verified, non-admin parents in this family...
   const { blobs } = await store.list({ prefix: "parent:" });
   const recipients = [];
   for (const b of blobs) {
     const p = await store.get(b.key, { type: "json" });
     if (p && p.familyId === auth.fid && !p.isAdmin && p.verified && p.email) recipients.push(p.email);
+  }
+  // ...plus any extra notification emails the parent added (assumed valid, no
+  // verification required). De-duplicate, cap at a sane total.
+  const extras = Array.isArray(notifyCfg.extraEmails) ? notifyCfg.extraEmails : [];
+  for (const e of extras) {
+    const em = normEmail(e);
+    if (em && isEmail(em) && !recipients.includes(em)) recipients.push(em);
   }
   if (recipients.length === 0) return json({ sent: 0, noRecipients: true }, 200);
 
@@ -1422,7 +1620,7 @@ function sanitizeCounts(counts) {
 }
 
 function publicKid(k) {
-  return { id: k.id, name: k.name, grade: k.grade, categories: k.categories || null, counts: k.counts || null };
+  return { id: k.id, name: k.name, grade: k.grade, categories: k.categories || null, counts: k.counts || null, icon: k.icon || "", color: k.color || "" };
 }
 function publicParent(p) {
   return { email: p.email || p.username, isAdmin: !!p.isAdmin, verified: !!p.verified || !!p.isAdmin };
@@ -1532,7 +1730,12 @@ async function safeText(res) {
 /* ------------------------------- email ---------------------------------- */
 // Public base URL of the app, used to build links in emails.
 function siteUrl() {
-  return (process.env.APP_URL || process.env.URL || "").replace(/\/$/, "");
+  // Prefer an explicit APP_URL, else Netlify's provided URL/DEPLOY_PRIME_URL.
+  let base = String(process.env.APP_URL || process.env.URL || process.env.DEPLOY_PRIME_URL || "").trim().replace(/\/$/, "");
+  if (!base) return ""; // caller handles the empty case
+  // Make sure it's absolute — a relative link is dead in email clients.
+  if (!/^https?:\/\//i.test(base)) base = "https://" + base.replace(/^\/+/, "");
+  return base;
 }
 
 // Send an email via Resend (https://resend.com). Returns { ok, configured }.
@@ -1561,23 +1764,112 @@ function signVerifyToken(pid) {
   return `${payload}.${sig}`;
 }
 
+function signResetToken(pid) {
+  const secret = requireSecret();
+  const payload = b64url(JSON.stringify({ pid, kind: "reset", exp: Date.now() + 1000 * 60 * 60 * 2 })); // 2h
+  const sig = b64url(crypto.createHmac("sha256", secret).update(payload).digest());
+  return `${payload}.${sig}`;
+}
+
+// Build + send a password-reset email. Returns { configured, devLink? }.
+async function sendPasswordResetEmail(store, parent) {
+  const token = signResetToken(parent.id);
+  const base = siteUrl();
+  if (!base) {
+    logEvent("error", "reset_no_base_url", "Password-reset link has no absolute base URL — set APP_URL", { username: parent.email });
+  }
+  const link = `${base}/?reset=${encodeURIComponent(token)}`;
+  const subject = "Reset your StudyQuest password";
+  const html =
+    `<div style="font-family:Arial,Helvetica,sans-serif;max-width:480px;margin:0 auto;padding:24px;color:#2b2438">` +
+    `<h1 style="color:#4a3f5e;font-size:22px">Reset your password</h1>` +
+    `<p style="font-size:15px;line-height:1.5">We received a request to reset the StudyQuest password for <strong>${esc(parent.email || "")}</strong>. Tap the button below to choose a new password. If you didn't ask for this, you can ignore this email — your password won't change.</p>` +
+    `<table role="presentation" cellpadding="0" cellspacing="0" style="margin:24px auto"><tr>` +
+    `<td align="center" bgcolor="#4a3f5e" style="border-radius:12px">` +
+    `<a href="${link}" target="_blank" style="display:inline-block;padding:14px 28px;font-family:Arial,Helvetica,sans-serif;font-size:16px;font-weight:bold;color:#ffffff;text-decoration:none;border-radius:12px">Reset my password →</a>` +
+    `</td></tr></table>` +
+    `<p style="font-size:14px;line-height:1.5">Or copy and paste this link into your browser:</p>` +
+    `<p style="font-size:14px;line-height:1.6;word-break:break-all"><a href="${link}" target="_blank" style="color:#3b7de8">${link}</a></p>` +
+    `<p style="color:#7a6f8c;font-size:13px;margin-top:24px">This link expires in 2 hours.</p>` +
+    `</div>`;
+  const text = `Reset your StudyQuest password by opening this link (expires in 2 hours):\n${link}\n\nIf you didn't request this, you can ignore this email.`;
+  const sent = await sendEmail({ to: parent.email, subject, html, text });
+  const out = { configured: sent.configured };
+  if (process.env.ALLOW_DEV_VERIFY_LINK === "1") out.devLink = link;
+  return out;
+}
+
+// Public: a user requests a reset link to their email. Always returns ok (so we
+// don't reveal which emails exist), but only sends if the account is real.
+async function handleRequestPasswordReset(body) {
+  requireSecret();
+  const email = normEmail(body.email);
+  if (!isEmail(email)) return json({ error: "Enter a valid email address." }, 400);
+  const store = db();
+  const pid = await store.get(`uname:${email}`);
+  if (pid) {
+    const parent = await store.get(`parent:${pid}`, { type: "json" });
+    if (parent && !parent.isAdmin) {
+      const sent = await sendPasswordResetEmail(store, parent);
+      logEvent("info", "reset_requested", `Password reset requested for ${email}`, { username: email, fid: parent.familyId }, { emailConfigured: sent.configured });
+      const out = { ok: true, emailConfigured: sent.configured };
+      if (sent.devLink) out.devLink = sent.devLink;
+      return json(out, 200);
+    }
+  } else {
+    logEvent("verbose", "reset_requested_unknown", `Password reset requested for unknown email ${email}`, { username: email });
+  }
+  return json({ ok: true }, 200);
+}
+
+// Public: consume a reset token and set the new password.
+async function handleResetPassword(body) {
+  requireSecret();
+  const token = String(body.token || "");
+  const newPassword = String(body.newPassword || "");
+  if (newPassword.length < 6) return json({ error: "New password must be at least 6 characters." }, 400);
+  const data = verifyTokenData(token);
+  if (!data || data.kind !== "reset" || !data.pid) return json({ error: "This reset link is invalid or has expired." }, 400);
+  const store = db();
+  const parent = await store.get(`parent:${data.pid}`, { type: "json" });
+  if (!parent) return json({ error: "Account not found." }, 404);
+  const { salt, hash } = hashPassword(newPassword);
+  // Resetting also verifies the email (they proved control of the inbox).
+  await store.setJSON(`parent:${parent.id}`, { ...parent, salt, hash, verified: true });
+  logEvent("info", "reset_done", `Password reset completed for ${parent.email || parent.username}`, { username: parent.email || parent.username, fid: parent.familyId });
+  return json({ ok: true, token: signToken(parent.id), parent: publicParent({ ...parent, verified: true }) }, 200);
+}
+
 // Build + send the verification email. Returns { configured, devLink? }.
 // In a dev environment (ALLOW_DEV_VERIFY_LINK=1) the link is also returned in
 // the API response so it can be tested without an email provider.
 async function sendVerificationEmail(store, parent) {
   const token = signVerifyToken(parent.id);
-  const base = siteUrl() || "";
+  const base = siteUrl();
+  if (!base) {
+    // No absolute site URL configured — the link would be relative and dead in
+    // email. Log it so the admin can spot/fix it (set APP_URL).
+    logEvent("error", "verify_no_base_url", "Verification email link has no absolute base URL — set APP_URL", { username: parent.email });
+  }
   const link = `${base}/?verify=${encodeURIComponent(token)}`;
   const subject = "Verify your StudyQuest email";
+
+  // A table-based "bulletproof button" renders reliably across Gmail, Yahoo,
+  // Outlook, and Apple Mail (a plain styled <a> can be stripped/mangled by some
+  // clients). We also show the full link as large, tappable text as a fallback.
   const html =
-    `<div style="font-family:system-ui,sans-serif;max-width:480px;margin:0 auto;padding:24px;color:#2b2438">` +
-    `<h1 style="color:#4a3f5e">Welcome to StudyQuest 🎓</h1>` +
-    `<p>Tap the button below to verify your email and activate your family account.</p>` +
-    `<p style="text-align:center;margin:28px 0"><a href="${link}" style="background:#4a3f5e;color:#fff;text-decoration:none;font-weight:700;padding:12px 24px;border-radius:12px">Verify my email</a></p>` +
-    `<p style="color:#7a6f8c;font-size:13px">If the button doesn't work, paste this link into your browser:<br>${link}</p>` +
-    `<p style="color:#7a6f8c;font-size:13px">This link expires in 48 hours. If you didn't sign up, you can ignore this email.</p>` +
+    `<div style="font-family:Arial,Helvetica,sans-serif;max-width:480px;margin:0 auto;padding:24px;color:#2b2438">` +
+    `<h1 style="color:#4a3f5e;font-size:22px">Welcome to StudyQuest 🎓</h1>` +
+    `<p style="font-size:15px;line-height:1.5">Confirm your email to activate your family account. Tap the button below, or use the link underneath it.</p>` +
+    `<table role="presentation" cellpadding="0" cellspacing="0" style="margin:24px auto"><tr>` +
+    `<td align="center" bgcolor="#4a3f5e" style="border-radius:12px">` +
+    `<a href="${link}" target="_blank" style="display:inline-block;padding:14px 28px;font-family:Arial,Helvetica,sans-serif;font-size:16px;font-weight:bold;color:#ffffff;text-decoration:none;border-radius:12px">Verify my email →</a>` +
+    `</td></tr></table>` +
+    `<p style="font-size:14px;line-height:1.5;color:#2b2438">Or copy and paste this link into your browser:</p>` +
+    `<p style="font-size:14px;line-height:1.6;word-break:break-all"><a href="${link}" target="_blank" style="color:#3b7de8">${link}</a></p>` +
+    `<p style="color:#7a6f8c;font-size:13px;margin-top:24px">This link expires in 48 hours. If you didn't sign up, you can safely ignore this email.</p>` +
     `</div>`;
-  const text = `Welcome to StudyQuest! Verify your email to activate your account: ${link}`;
+  const text = `Welcome to StudyQuest!\n\nVerify your email to activate your account by opening this link:\n${link}\n\nThis link expires in 48 hours. If you didn't sign up, you can ignore this email.`;
   const sent = await sendEmail({ to: parent.email, subject, html, text });
   const out = { configured: sent.configured };
   if (process.env.ALLOW_DEV_VERIFY_LINK === "1") out.devLink = link;

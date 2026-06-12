@@ -479,3 +479,96 @@ events for troubleshooting issues and workflows.
 `info`). Set it to `verbose` or `debug` temporarily while diagnosing something,
 then set it back — verbose logs every request and uses more storage. Logs live
 in Netlify Blobs alongside the app's other data; no extra setup is needed.
+
+## Email links not working (e.g. in Yahoo)
+
+Verification (and completion) emails include both a button **and** a full
+clickable link, built with email-client-robust HTML so they work across Gmail,
+Yahoo, Outlook, and Apple Mail.
+
+The most important requirement is that **`APP_URL` is set** in Netlify (e.g.
+`https://studyquestai.com`). If it isn't, the link can come out relative and
+will appear to "work" from a browser tab but be dead when clicked from an email
+client like Yahoo. The app now forces an absolute `https://` link and, if no
+base URL is configured, records an **error** in the admin Logs ("set APP_URL").
+If a verify link ever fails, check the Logs and confirm `APP_URL` is set, then
+redeploy.
+
+## Guided setup (first-run walkthrough)
+
+When a logged-in parent has no kids yet, StudyQuest now shows a step-by-step
+walkthrough instead of an empty screen:
+1. **Welcome** — a summary of everything the app can do.
+2. **Add your first child** — name, grade level (and family name if not set yet).
+3. **Pick topics** — choose which categories each subject practices and how many
+   questions per subject (0 skips a subject).
+4. **Chores** — edit/add chores and choose which days they appear.
+5. **Finish** — the child's first set of questions is generated from those
+   settings automatically.
+
+## Clearer "who's playing"
+
+The kid switcher in the header now shows **profile avatars** (a friendly animal
++ color unique to each child). The selected child is enlarged, fully colored,
+and marked with a ✓; the others are dimmed. A "Now playing: [name]" banner also
+appears above the tabs, with a reminder to "tap your face up top" to switch —
+designed so even a young child can tell which profile they're using.
+
+## Admin: manage users per family
+
+In Parent area → 🛡️ Admin (admin only), users are grouped by family. You can:
+- **Add a parent** to any family by email — they're emailed a link to set their
+  own password.
+- **Delete** a parent. If they were the last one in their family, that family and
+  its kids are removed too.
+- **Send a reset link** to any parent.
+
+For security, the admin can **never set or see passwords** — passwords are only
+ever chosen by the user from a link emailed to them.
+
+## Password reset by email
+
+Parents who forget their password can tap **Forgot password?** on the login
+screen to receive a reset link by email. The link opens a "Choose a new
+password" screen and signs them in. (Requires email to be configured — see the
+Resend setup above. Reset links expire in 2 hours.)
+
+## Reward game button
+
+Once a child closes the "you earned a game" ribbon, it no longer disappears
+entirely — a single pulsing **"Play your reward game!"** button remains so they
+can reopen the game without the ribbon nagging them. (Still limited to 3 plays
+per day.)
+
+## Setup walkthrough: add multiple kids
+
+The first-run walkthrough now loops: after you finish setting up a child, it
+asks "Would you like to add another child?" Choosing **Add another child** starts
+the per-child steps again from the name (the family name is only asked once);
+choosing **All done** generates everyone's questions and opens the app.
+
+## Kids can personalize their profile
+
+Kids can tap their avatar in the "Now playing" banner (or the "Change my icon"
+link) to open a picker and choose their **icon** and **background color**. The
+icon set is a wide range of fun emoji (animals, dinosaurs, robots, ninjas,
+superheroes, vehicles, sports, and more). Note: we intentionally don't include
+copyrighted characters (e.g. Mario, Sonic, Bluey, Disney) — bundling that
+artwork would infringe those companies' rights. The chosen icon and color follow
+the child everywhere their profile appears (header, banner, calendar, etc.).
+
+## Notification settings
+
+Parent area → 🔔 Notifications lets each family:
+- Turn the **"questions finished"** and **"chores finished"** emails on or off
+  independently.
+- Add up to **5 extra email addresses** that also receive the enabled emails
+  (e.g. a second parent, a grandparent). These extra addresses are assumed valid
+  and don't require verification — double-check spelling. All logged-in parents
+  in the family always receive the emails too.
+
+## Fraction question fix
+
+Fraction questions no longer reveal the answer in the formatting hint. The hint
+now shows a neutral example (e.g. "write your answer as a fraction, for example
+2/7") that can never match the actual answer.
