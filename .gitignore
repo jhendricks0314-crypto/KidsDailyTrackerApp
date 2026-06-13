@@ -6,8 +6,6 @@ dist
 .DS_Store
 *.log
 .vite
-node_modules
-
 # generated at build time by scripts/stamp-version.mjs
 src/version.js
 public/version.json

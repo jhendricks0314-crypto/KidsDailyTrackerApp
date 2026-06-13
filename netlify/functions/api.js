@@ -213,6 +213,8 @@ async function routeAction(action, request, body, requestId) {
         return await withAdmin(request, (auth) => handleAdminDeleteUser(auth, body));
       case "admin-send-reset":
         return await withAdmin(request, (auth) => handleAdminSendReset(auth, body));
+      case "admin-cleanup-families":
+        return await withAdmin(request, () => handleAdminCleanupFamilies());
       case "admin-logs":
         return await withAdmin(request, () => handleAdminLogs(body));
       case "admin-log-clear":
@@ -728,6 +730,35 @@ async function deleteFamilyIfEmpty(store, fid, leavingPid) {
   return true;
 }
 
+// Find every family that has no parents and delete it (and its kids/data).
+// Returns the number of families removed. Safe to call routinely.
+async function sweepOrphanFamilies(store) {
+  let removed = 0;
+  try {
+    // Collect the set of family ids that still have at least one parent.
+    const { blobs: parentBlobs } = await store.list({ prefix: "parent:" });
+    const familiesWithParents = new Set();
+    for (const b of parentBlobs) {
+      const p = await store.get(b.key, { type: "json" });
+      if (p && p.familyId) familiesWithParents.add(p.familyId);
+    }
+    // Any family blob whose id isn't in that set is orphaned.
+    const { blobs: famBlobs } = await store.list({ prefix: "family:" });
+    for (const b of famBlobs) {
+      const fam = await store.get(b.key, { type: "json" });
+      if (!fam || !fam.id) continue;
+      if (!familiesWithParents.has(fam.id)) {
+        // pass a sentinel leavingPid so the helper treats it as truly empty
+        const did = await deleteFamilyIfEmpty(store, fam.id, "__sweep__");
+        if (did) removed++;
+      }
+    }
+  } catch {
+    /* best-effort */
+  }
+  return removed;
+}
+
 // Regenerate the family code AND revoke existing kid-device links.
 async function handleFamilyRegenCode(auth) {
   const store = db();
@@ -790,6 +821,9 @@ async function handleAdminInit(body) {
 // List every parent account (admin view). Never returns password hashes.
 async function handleAdminListUsers() {
   const store = db();
+  // Opportunistically clean up any families that no longer have parents, so the
+  // admin view never shows orphaned families.
+  await sweepOrphanFamilies(store);
   // map family ids to names + codes
   const famMap = {};
   try {
@@ -907,6 +941,14 @@ async function handleAdminSendReset(auth, body) {
   const out = { ok: true, emailConfigured: sent.configured };
   if (sent.devLink) out.devLink = sent.devLink;
   return json(out, 200);
+}
+
+// Admin: delete every family that has no parents (and all its kids/data).
+async function handleAdminCleanupFamilies() {
+  const store = db();
+  const removed = await sweepOrphanFamilies(store);
+  logEvent("warn", "admin_cleanup_families", `Admin cleaned up orphaned families — ${removed} removed`, {});
+  return json({ ok: true, removed }, 200);
 }
 
 // Admin sets a new password for a target account (by email).
@@ -1055,6 +1097,13 @@ async function handleKidCreate(auth, body) {
   const kids = await getKids(store, fid);
   if (kids.length >= 20) return json({ error: "Too many kids on one account." }, 400);
   const kid = { id: uid(), name, grade, createdAt: Date.now() };
+  // Allow setting categories/counts/avatar at creation time, so the wizard can
+  // do everything in a single write (no create-then-update round-trip that
+  // could race on eventually-consistent storage).
+  if (body.categories && typeof body.categories === "object") kid.categories = sanitizeCategories(body.categories);
+  if (body.counts && typeof body.counts === "object") kid.counts = sanitizeCounts(body.counts);
+  if (typeof body.icon === "string") kid.icon = body.icon.slice(0, 8);
+  if (typeof body.color === "string" && /^#[0-9a-fA-F]{6}$/.test(body.color)) kid.color = body.color;
   kids.push(kid);
   await store.setJSON(`kids:${fid}`, kids);
   return json({ kid: publicKid(kid), kids: kids.map(publicKid) }, 200);
@@ -1149,12 +1198,38 @@ async function handleKidDelete(auth, body) {
 
 async function handleData(auth, body) {
   const op = body.op;
+
+  const store = db();
+  const fid = auth.fid;
+
+  // Batch get: fetch many keys at once (used by the calendar to load a whole
+  // month in one request instead of dozens of sequential round-trips).
+  if (op === "mget") {
+    const keys = Array.isArray(body.keys) ? body.keys.slice(0, 200) : [];
+    const kids = await getKids(store, fid);
+    const allowed = new Set(kids.map((k) => k.id));
+    const results = await Promise.all(
+      keys.map(async (k) => {
+        const key = String(k || "");
+        const kidId = keyKidId(key);
+        if (!kidId || !isAllowedDataKey(key) || !allowed.has(kidId)) return [key, null];
+        try {
+          const value = await store.get(`d:${key}`, { type: "json" });
+          return [key, value ?? null];
+        } catch {
+          return [key, null];
+        }
+      })
+    );
+    const values = {};
+    for (const [k, v] of results) values[k] = v;
+    return json({ values }, 200);
+  }
+
   const key = String(body.key || "");
   const kidId = keyKidId(key);
   if (!kidId || !isAllowedDataKey(key)) return json({ error: "Bad data key" }, 400);
 
-  const store = db();
-  const fid = auth.fid;
   const kids = await getKids(store, fid);
   if (!kids.some((k) => k.id === kidId)) {
     return json({ error: "Not authorized for this child." }, 403);
@@ -1414,6 +1489,12 @@ async function handleHelp(auth, body) {
 // (we don't just trust the client), and a per-kid/day flag prevents duplicates.
 
 const NOTIFY_SUBJECTS = ["Math", "Reading & Writing", "Science", "History", "Geography"];
+// Subjects actually present in a stored day (includes optional/extra subjects).
+// Meta keys (those starting with "__") are skipped.
+function daySubjects(day) {
+  if (!day || typeof day !== "object") return [];
+  return Object.keys(day).filter((k) => !k.startsWith("__") && Array.isArray(day[k]));
+}
 
 function choreAppliesOnDate(c, dateKey) {
   if (!Array.isArray(c.days) || c.days.length === 0) return true;
@@ -1456,7 +1537,7 @@ async function handleNotify(auth, body) {
     const day = await store.get(`d:daily:${kidId}:${date}`, { type: "json" });
     if (!day) return json({ notReady: true }, 200);
     let total = 0, checked = 0, right = 0;
-    for (const s of NOTIFY_SUBJECTS) {
+    for (const s of daySubjects(day)) {
       for (const it of day[s] || []) {
         total++;
         if (it.checked) checked++;
@@ -1522,7 +1603,7 @@ function esc(s) {
 
 function buildQuestionsEmail(kid, day, right, total, date) {
   const pct = total > 0 ? Math.round((right / total) * 100) : 0;
-  const blocks = NOTIFY_SUBJECTS.map((s) => {
+  const blocks = daySubjects(day).map((s) => {
     const list = day[s] || [];
     if (!list.length) return "";
     const rows = list
@@ -1552,7 +1633,7 @@ function buildQuestionsEmail(kid, day, right, total, date) {
     `<p style="color:#a99fb8;font-size:12px;margin-top:18px">Sent by StudyQuest when your child finished their questions.</p>` +
     `</div>`;
   const textLines = [`${kid.name} finished today's questions — ${right}/${total} correct (${pct}%)`, prettyDate(date), ""];
-  for (const s of NOTIFY_SUBJECTS) {
+  for (const s of daySubjects(day)) {
     const list = day[s] || [];
     if (!list.length) continue;
     textLines.push(`== ${s} ==`);

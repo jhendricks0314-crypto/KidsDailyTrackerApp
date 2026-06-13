@@ -572,3 +572,85 @@ Parent area → 🔔 Notifications lets each family:
 Fraction questions no longer reveal the answer in the formatting hint. The hint
 now shows a neutral example (e.g. "write your answer as a fraction, for example
 2/7") that can never match the actual answer.
+
+## Faster calendar
+
+The progress calendar previously fetched each day's questions and chores in
+separate, sequential requests (dozens of round-trips per month), which made it
+slow to update. It now loads the whole month in a **single batched request**
+(via a new `mget` data operation) and **caches** months it has already loaded,
+so opening the calendar and flipping between months is much faster. Past months
+are never re-fetched (they don't change); the current month refreshes in the
+background while showing cached data instantly.
+
+## Fixes
+
+- **Wizard "Child not found" on save:** the setup walkthrough now creates the
+  child and their categories/counts in a single atomic write (instead of
+  create-then-update), and uses the authoritative new-child id returned by the
+  server. This removes the race that could produce a "Child not found" error
+  when saving a new kid's settings.
+- **Orphaned families auto-cleanup:** any family left with no parents (and all of
+  its kids/data) is now deleted automatically — this runs whenever the admin
+  opens the Users-by-Family screen, and after any parent is removed. There's also
+  a 🧹 "Clean up orphaned families" button in the Admin tab to do it on demand.
+
+## More fixes & features
+
+- **Add-a-kid uses the setup walkthrough:** adding a child from the parent
+  (Kids) page now launches the same guided flow — name & grade, then topics &
+  per-subject question counts, then chores — starting at the child's name (the
+  Welcome screen is skipped). Questions are generated from the chosen counts
+  instead of defaulting to 10.
+- **Fixed Science/History resetting to 0:** a subject whose count wasn't
+  explicitly set is now correctly treated as the default rather than 0.
+- **Changing categories updates questions:** when a parent saves category/count
+  changes, today's set is topped up if a subject's count increased (existing
+  questions and answers are kept; only the unanswered tail is trimmed if a count
+  decreased), and untouched upcoming days are regenerated with the new settings.
+- **Extra subjects:** beyond the core five, parents can now add up to 5 optional
+  subjects — Art, Music, Coding, Health, and Spanish — each with their own
+  topics. They're off by default and added from the Categories screen (or during
+  setup).
+- **Questions are pre-generated ~10 days ahead** in a single batch instead of an
+  API call every day, which makes daily loads faster and cheaper. The existing
+  rule is preserved: new days are only generated when the most recent set was at
+  least half answered, so it won't pile on work if a child falls behind.
+
+## Kids Mode (open straight to the family, no login)
+
+A child should be able to just open the installed app and see their family — no
+password. To set this up on a child's device:
+
+1. Install StudyQuest on the device (Add to Home Screen) and log in as a parent
+   once.
+2. Go to the parent area → 👨‍👩‍👧 Family → **"Switch this device to Kids Mode."**
+
+From then on, every time the app is opened on that device it goes straight to
+the family's kid view with no login. Under the hood this stores a long-lived
+(1-year), family-scoped token on the device; the parent account is logged out on
+that device so it stays a kid device. A parent can tap the 🔒 lock button and log
+in again anytime to regain parent access (e.g. to change settings), and can
+switch back to Kids Mode afterward.
+
+Notes:
+- The kid-mode token only allows kid actions (viewing/answering questions,
+  chores, choosing an avatar). It can't reach parent-only screens or other
+  families.
+- This is per device — set it up on each child's tablet. (The older "copy the
+  kids' link" method still works too.)
+- "↻ new code" still revokes all kid-mode devices if you ever need to.
+
+## Subjects (formerly "Categories")
+
+The "Categories" chooser is now called **Subjects**. The two levels are now
+named clearly:
+- **Subjects** — the things you pick for each child (Math, Reading & Writing,
+  Science, History, Geography, Art, Music, Coding, Health, Spanish).
+- **Topics** — the sub-areas inside each subject (e.g. Addition, Fractions).
+
+You can now freely choose **any 1 to 10 subjects** for each child — nothing is
+mandatory. Turn subjects on or off in the Subjects tab (at least one must stay
+on), pick the topics within each, and set how many questions per subject per day
+(1–20). Existing children keep their current subjects; brand-new children start
+with the five original subjects on by default, which you can change.

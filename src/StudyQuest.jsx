@@ -16,6 +16,14 @@ const todayKey = () => {
   ).padStart(2, "0")}`;
 };
 
+// Date key (YYYY-MM-DD) for `offset` days after a given key (default: today).
+const dateKeyPlus = (offset, fromKey) => {
+  const base = fromKey ? fromKey.split("-").map(Number) : null;
+  const d = base ? new Date(base[0], base[1] - 1, base[2]) : new Date();
+  d.setDate(d.getDate() + offset);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+};
+
 const fmtDate = (key) => {
   const [y, m, d] = key.split("-").map(Number);
   return new Date(y, m - 1, d).toLocaleDateString(undefined, {
@@ -188,6 +196,17 @@ const api = {
     setFamilyToken(r.token);
     return true;
   },
+  // Turn THIS device into the no-login kid device for the logged-in parent's
+  // own family. Looks up the family code, then stores a long-lived family token
+  // so future opens go straight to the family without a login.
+  async enterKidModeForOwnFamily() {
+    const info = await apiRequest("family-info");
+    const code = info && info.code;
+    if (!code) throw new Error("Could not find your family code.");
+    const r = await apiRequest("family-access", { code });
+    setFamilyToken(r.token);
+    return true;
+  },
   // Already-logged-in parent joins a family by invite code.
   async familyJoin(code) {
     return apiRequest("family-join", { code });
@@ -241,9 +260,11 @@ const api = {
     const r = await apiRequest("kids-list");
     return { kids: (r && r.kids) || [], familyName: (r && r.familyName) || "" };
   },
-  async createKid(name, grade) {
-    const r = await apiRequest("kid-create", { name, grade });
-    return (r && r.kids) || [];
+  async createKid(name, grade, extra) {
+    const r = await apiRequest("kid-create", { name, grade, ...(extra || {}) });
+    // Return both the authoritative created kid and the full list so callers
+    // never have to guess which entry is the new one.
+    return { kid: (r && r.kid) || null, kids: (r && r.kids) || [] };
   },
   async updateKid(id, patch) {
     const r = await apiRequest("kid-update", { id, ...patch });
@@ -301,6 +322,9 @@ const api = {
   async adminSendReset(email) {
     return apiRequest("admin-send-reset", { email });
   },
+  async adminCleanupFamilies() {
+    return apiRequest("admin-cleanup-families");
+  },
   async requestPasswordReset(email) {
     return apiRequest("request-password-reset", { email });
   },
@@ -331,6 +355,15 @@ const store = {
       return false;
     }
   },
+  // Batch fetch many keys in a single request. Returns { key: value|null }.
+  async mget(keys) {
+    try {
+      const r = await apiRequest("data", { op: "mget", keys });
+      return (r && r.values) || {};
+    } catch {
+      return {};
+    }
+  },
 };
 
 /* ========================================================================
@@ -349,6 +382,11 @@ const SUBJECT_CATEGORIES = {
   Science: ["Life Science", "Earth & Space", "Physical Science", "The Human Body", "Animals & Plants", "Weather"],
   History: ["U.S. History", "World History", "Ancient Civilizations", "Famous People", "Inventions"],
   Geography: ["Capitals", "Continents & Oceans", "Countries", "Physical Geography", "U.S. States"],
+  Art: ["Color Theory", "Famous Artists", "Drawing Basics", "Art History", "Techniques"],
+  Music: ["Instruments", "Rhythm & Beat", "Reading Music", "Famous Composers", "Music Theory"],
+  Coding: ["Logic & Sequencing", "Loops", "Variables", "Conditionals", "Computer Basics"],
+  Health: ["Nutrition", "The Human Body", "Hygiene", "Exercise & Fitness", "Safety"],
+  Spanish: ["Greetings", "Colors", "Numbers", "Common Words", "Simple Phrases"],
 };
 // Math categories that work for a given grade (keeps young kids on basics)
 function mathCategoriesForGrade(grade) {
@@ -737,16 +775,133 @@ function genGeography(grade) {
   return { type: "text", ...pick(pool) };
 }
 
+// Generic curated fallback generator for the optional "extra" subjects. These
+// are normally AI-generated; this provides a small offline pool per subject.
+function makeGen(pools) {
+  return (grade) => {
+    const easy = pools.easy || [];
+    const mid = pools.mid || easy;
+    const hard = pools.hard || mid;
+    const pool = grade <= 3 ? easy : grade <= 7 ? [...easy, ...mid] : [...mid, ...hard];
+    return { type: "text", ...pick(pool.length ? pool : easy) };
+  };
+}
+
+const genArt = makeGen({
+  easy: [
+    { q: "What three colors are the primary colors?", a: "red, yellow, blue", accept: ["red yellow blue", "red, yellow, and blue", "red blue yellow"] },
+    { q: "What do you get when you mix blue and yellow paint?", a: "green", accept: ["green"] },
+    { q: "What tool do painters use to apply paint to a canvas?", a: "brush", accept: ["brush", "paintbrush", "a brush"] },
+  ],
+  mid: [
+    { q: "What do you get when you mix red and blue paint?", a: "purple", accept: ["purple", "violet"] },
+    { q: "Who painted the Mona Lisa?", a: "Leonardo da Vinci", accept: ["da vinci", "leonardo", "leonardo da vinci"] },
+    { q: "What is a picture you make of yourself called?", a: "self-portrait", accept: ["self portrait", "self-portrait", "portrait"] },
+  ],
+  hard: [
+    { q: "What art movement is Pablo Picasso associated with founding?", a: "Cubism", accept: ["cubism"] },
+    { q: "What do we call the use of light and shadow to create depth in art?", a: "shading", accept: ["shading", "chiaroscuro", "value"] },
+  ],
+});
+const genMusic = makeGen({
+  easy: [
+    { q: "How many strings does a standard guitar have?", a: "6", accept: ["6", "six"] },
+    { q: "What instrument has black and white keys?", a: "piano", accept: ["piano", "keyboard"] },
+    { q: "Is a drum a string, wind, or percussion instrument?", a: "percussion", accept: ["percussion"] },
+  ],
+  mid: [
+    { q: "How many notes are in a musical octave (counting the repeat)?", a: "8", accept: ["8", "eight"] },
+    { q: "What do we call how high or low a sound is?", a: "pitch", accept: ["pitch"] },
+    { q: "What family does the violin belong to?", a: "string", accept: ["string", "strings", "string family"] },
+  ],
+  hard: [
+    { q: "How many lines are on a musical staff?", a: "5", accept: ["5", "five"] },
+    { q: "What Italian word means to play loudly?", a: "forte", accept: ["forte"] },
+  ],
+});
+const genCoding = makeGen({
+  easy: [
+    { q: "In computers, what does a list of step-by-step instructions get called?", a: "a program", accept: ["program", "a program", "code", "algorithm"] },
+    { q: "What do we call a mistake in a computer program?", a: "a bug", accept: ["bug", "a bug", "error"] },
+    { q: "Does a computer do exactly what you tell it, or what you mean?", a: "exactly what you tell it", accept: ["exactly what you tell it", "what you tell it", "tell it"] },
+  ],
+  mid: [
+    { q: "What do we call a set of steps that repeats in code?", a: "a loop", accept: ["loop", "a loop"] },
+    { q: "What symbol often starts a line that the computer ignores (a comment) in many languages?", a: "//", accept: ["//", "slash slash", "#", "hashtag"] },
+    { q: "What do we call a box that stores a value in a program?", a: "a variable", accept: ["variable", "a variable"] },
+  ],
+  hard: [
+    { q: "What do we call code that runs only when a condition is true?", a: "an if statement", accept: ["if statement", "an if statement", "conditional", "if"] },
+    { q: "What number system (base 2) do computers use?", a: "binary", accept: ["binary", "base 2", "base two"] },
+  ],
+});
+const genHealth = makeGen({
+  easy: [
+    { q: "How many times a day should you brush your teeth?", a: "2", accept: ["2", "two", "twice"] },
+    { q: "What should you do before eating to keep germs away?", a: "wash your hands", accept: ["wash your hands", "wash hands", "washing hands"] },
+    { q: "Which is a healthier snack: an apple or candy?", a: "an apple", accept: ["apple", "an apple"] },
+  ],
+  mid: [
+    { q: "How many hours of sleep does a child your age need each night (about)?", a: "9-11", accept: ["9", "10", "11", "9-11", "nine", "ten", "about 10"] },
+    { q: "What food group are carrots and broccoli in?", a: "vegetables", accept: ["vegetables", "vegetable", "veggies"] },
+    { q: "What part of your body pumps blood?", a: "heart", accept: ["heart", "the heart"] },
+  ],
+  hard: [
+    { q: "What nutrient do you find a lot of in meat, beans, and eggs?", a: "protein", accept: ["protein"] },
+    { q: "What vitamin does your skin make from sunlight?", a: "vitamin D", accept: ["vitamin d", "d"] },
+  ],
+});
+const genSpanish = makeGen({
+  easy: [
+    { q: "How do you say 'hello' in Spanish?", a: "hola", accept: ["hola"] },
+    { q: "What does 'gato' mean in English?", a: "cat", accept: ["cat", "a cat"] },
+    { q: "How do you say 'thank you' in Spanish?", a: "gracias", accept: ["gracias"] },
+  ],
+  mid: [
+    { q: "What does 'rojo' mean in English?", a: "red", accept: ["red"] },
+    { q: "How do you say 'goodbye' in Spanish?", a: "adiós", accept: ["adios", "adiós"] },
+    { q: "What is the English word for 'casa'?", a: "house", accept: ["house", "home"] },
+  ],
+  hard: [
+    { q: "What does 'biblioteca' mean in English?", a: "library", accept: ["library"] },
+    { q: "How do you say 'I am happy' in Spanish?", a: "estoy feliz", accept: ["estoy feliz", "soy feliz"] },
+  ],
+});
+
 const SUBJECTS = [
   { key: "Math", gen: genMath, color: "#e8743b" },
   { key: "Reading & Writing", gen: genReading, color: "#3b7de8" },
   { key: "Science", gen: genScience, color: "#2fa84f" },
   { key: "History", gen: genHistory, color: "#9b4dca" },
   { key: "Geography", gen: genGeography, color: "#d4a017" },
+  // optional extra subjects (off by default; parent can enable up to a max)
+  { key: "Art", gen: genArt, color: "#e84393", optional: true },
+  { key: "Music", gen: genMusic, color: "#0984e3", optional: true },
+  { key: "Coding", gen: genCoding, color: "#1f9d9d", optional: true },
+  { key: "Health", gen: genHealth, color: "#00b894", optional: true },
+  { key: "Spanish", gen: genSpanish, color: "#d4a017", optional: true },
 ];
 
-// Resolve which categories are selected for a subject for this kid.
-// Falls back to all built-in categories when nothing is chosen.
+// All subjects can be freely chosen per kid (1 to 10). For a brand-new kid with
+// no saved settings yet, these are the subjects enabled by default.
+const DEFAULT_SUBJECTS = ["Math", "Reading & Writing", "Science", "History", "Geography"];
+const MAX_SUBJECTS = 10; // there are 10 subjects total
+const MIN_SUBJECTS = 1;  // a kid must have at least one subject
+
+// A subject is "enabled" for a kid when it has a question count of 1+.
+function subjectEnabled(subjectKey, kid) {
+  return countFor(subjectKey, kid) > 0;
+}
+// The list of subject keys currently enabled for a kid (count >= 1). For a kid
+// with no saved counts at all, falls back to the default subject set.
+function enabledSubjects(kid) {
+  const hasAnyCounts = kid && kid.counts && Object.keys(kid.counts).length > 0;
+  if (!hasAnyCounts) return [...DEFAULT_SUBJECTS];
+  return SUBJECTS.map((s) => s.key).filter((k) => countFor(k, kid) > 0);
+}
+
+// Resolve which topics are selected for a subject for this kid.
+// Falls back to all built-in topics when nothing is chosen.
 function selectedCategoriesFor(subjectKey, kid) {
   const builtIn = SUBJECT_CATEGORIES[subjectKey] || [];
   const custom = (kid && kid.categories && kid.categories.custom && kid.categories.custom[subjectKey]) || [];
@@ -756,21 +911,26 @@ function selectedCategoriesFor(subjectKey, kid) {
     const filtered = sel.filter((c) => available.includes(c));
     if (filtered.length) return filtered;
   }
-  // default: focus on all built-in categories (grade-limited for math)
+  // default: focus on all built-in topics (grade-limited for math)
   return subjectKey === "Math" ? mathCategoriesForGrade(kid ? kid.grade : 3) : builtIn;
 }
 
 const blankItem = (item) => ({ ...item, response: "", checked: false, correct: null, misses: 0, help: "" });
 
 // How many questions to generate for a subject for this kid (parent-set, 0-20).
-// Default is 10. 0 means "skip this subject".
+// A kid with no saved settings yet uses the default subjects at 10 each; every
+// other subject is off (0) until the parent turns it on.
 function countFor(subjectKey, kid) {
   const c = kid && kid.counts && kid.counts[subjectKey];
   if (c === 0) return 0;
-  if (c == null || c === "") return 10; // no per-subject value set -> default
+  if (c == null || c === "") {
+    const hasAnyCounts = kid && kid.counts && Object.keys(kid.counts).length > 0;
+    if (hasAnyCounts) return 0; // counts exist but not this one -> subject is off
+    return DEFAULT_SUBJECTS.includes(subjectKey) ? 10 : 0; // brand-new kid default
+  }
   const n = Math.round(Number(c));
   if (Number.isFinite(n) && n >= 0 && n <= 20) return n;
-  return 10;
+  return 0;
 }
 
 // Procedural Math: round-robin across the selected operation categories.
@@ -915,6 +1075,90 @@ async function buildDay(grade, kid) {
   out["Math"] = mathList.slice(0, mathTotal);
 
   return out;
+}
+
+// Build N days of questions in as few AI calls as possible. We request
+// count*N items per text subject in ONE call, then deal them out across the N
+// days; Math is generated procedurally per day. Returns an array of day objects
+// (index 0 = first day). Falls back gracefully per subject if the AI call fails.
+async function buildDaysAhead(grade, kid, numDays) {
+  const N = Math.max(1, Math.min(14, numDays));
+  const days = Array.from({ length: N }, () => ({}));
+
+  // ----- gather per-subject plans
+  const textSubjects = SUBJECTS.filter((s) => s.key !== "Math");
+  const aiRequests = [];
+
+  // Math split (per-day counts are small; we generate procedurally per day)
+  const mathTotal = countFor("Math", kid);
+  const mathSplit = splitCategories("Math", kid);
+  let mathCustomPerDay = 0;
+  if (mathTotal > 0 && mathSplit.customSel.length) {
+    const tot = mathSplit.builtInSel.length + mathSplit.customSel.length;
+    mathCustomPerDay = Math.round((mathSplit.customSel.length / tot) * mathTotal);
+    if (mathCustomPerDay === 0) mathCustomPerDay = 1;
+    if (mathSplit.builtInSel.length === 0) mathCustomPerDay = mathTotal;
+    mathCustomPerDay = Math.min(mathTotal, mathCustomPerDay);
+  }
+  const mathBuiltInPerDay = mathTotal - mathCustomPerDay;
+  if (mathCustomPerDay > 0) aiRequests.push({ subject: "Math", categories: mathSplit.customSel, count: mathCustomPerDay * N });
+
+  for (const s of textSubjects) {
+    const n = countFor(s.key, kid);
+    if (n > 0) aiRequests.push({ subject: s.key, categories: selectedCategoriesFor(s.key, kid), count: n * N });
+  }
+
+  // ----- one big AI call (the backend caps counts; we also cap N*count above)
+  let generated = null;
+  if (aiRequests.length) {
+    try {
+      generated = await api.generateQuestions(grade, aiRequests);
+    } catch {
+      generated = null;
+    }
+  }
+
+  // helper: take the i-th slice of size `per` from an array (wrapping if short)
+  const sliceFor = (arr, dayIdx, per) => {
+    if (!arr || !arr.length || per <= 0) return [];
+    const out = [];
+    for (let k = 0; k < per; k++) out.push(arr[(dayIdx * per + k) % arr.length]);
+    return out;
+  };
+
+  for (let i = 0; i < N; i++) {
+    const dayGrade = grade;
+    // text subjects
+    for (const s of textSubjects) {
+      const n = countFor(s.key, kid);
+      if (n === 0) { days[i][s.key] = []; continue; }
+      const gen = generated && generated[s.key];
+      if (gen && gen.length) {
+        const chunk = sliceFor(gen, i, n).map((it) => blankItem({ type: "text", q: it.q, a: it.a, accept: [it.a], category: it.category || "" }));
+        while (chunk.length < n) chunk.push(blankItem(SUBJECTS.find((x) => x.key === s.key).gen(dayGrade)));
+        days[i][s.key] = chunk.slice(0, n);
+      } else {
+        // procedural fallback, regenerated per day for variety
+        const list = [];
+        const seen = new Set();
+        let guard = 0;
+        const genFn = SUBJECTS.find((x) => x.key === s.key).gen;
+        while (list.length < n && guard < 300) { guard++; const it = genFn(dayGrade); if (seen.has(it.q)) continue; seen.add(it.q); list.push(blankItem(it)); }
+        while (list.length < n) list.push(blankItem(genFn(dayGrade)));
+        days[i][s.key] = list;
+      }
+    }
+    // Math: procedural built-in per day + AI custom slice
+    let mathList = mathBuiltInPerDay > 0 ? buildMathList(dayGrade, mathSplit.builtInSel, mathBuiltInPerDay) : [];
+    const mathGen = generated && generated["Math"];
+    if (mathCustomPerDay > 0 && mathGen && mathGen.length) {
+      mathList = mathList.concat(sliceFor(mathGen, i, mathCustomPerDay).map((it) => blankItem({ type: "math", q: it.q, a: it.a, accept: [it.a], category: it.category || "" })));
+    }
+    while (mathList.length < mathTotal) mathList.push(blankItem(genMath(dayGrade, pick(mathCategoriesForGrade(dayGrade)))));
+    days[i]["Math"] = mathList.slice(0, mathTotal);
+  }
+
+  return days;
 }
 
 // offline / fallback grading (also used for math, always)
@@ -1314,6 +1558,28 @@ export default function App() {
     }
   };
 
+  // Convert this (installed) device into the no-login kid device for the
+  // logged-in parent's family. After this, every open lands on the family view
+  // with no login until a parent explicitly logs back in on this device.
+  const enterKidMode = async () => {
+    await api.enterKidModeForOwnFamily();
+    // This device is now a kid device. Drop the PARENT token so future opens go
+    // straight to the family (the boot logic checks the parent token first; if
+    // we kept it, the app would reopen in parent mode). A parent can log back in
+    // any time via the lock button to regain parent access on this device.
+    api.logout(); // clears only the parent token; the family token remains
+    setParentMode(false);
+    setParentUnlocked(false);
+    setParent(null);
+    setFamilyMode(true);
+    setLoading(true);
+    try {
+      await loadKidsInto();
+    } finally {
+      setLoading(false);
+    }
+  };
+
   // refresh kids after parent edits. Pass a known array (e.g. the one a
   // create/update/delete call already returned) to update instantly without a
   // second fetch that could momentarily return stale data.
@@ -1338,19 +1604,53 @@ export default function App() {
       const kid = kids.find((x) => x.id === kidId);
       if (!kid) return;
 
-      // daily questions — generate once per day, and never regenerate over a
-      // set that's already in progress. If a stored day exists with questions,
-      // we always keep it (this also enforces "don't generate new questions if
-      // the current ones are <50% answered" — they're kept, not replaced).
+      // daily questions. We pre-generate a batch of upcoming days so we don't
+      // call the API every single day. Rules preserved:
+      //  - never regenerate a day that already has questions (in progress/done)
+      //  - only generate NEW upcoming days if the most recent generated day was
+      //    completed to at least REGEN_THRESHOLD (otherwise just ensure today
+      //    exists, so the child always has work but we don't pile on more).
+      const DAYS_AHEAD = 10;
+      const REGEN_THRESHOLD = 0.5; // 50% of the latest day must be answered
       const dayKeyName = `daily:${kidId}:${date}`;
       let d = await store.get(dayKeyName);
+
       if (!dayHasQuestions(d)) {
-        // No usable set yet for today -> build one (the only time we call the API).
         setDay(null);
         setDayLoading(true);
         try {
-          d = await buildDay(kid.grade, kid);
-          await store.set(dayKeyName, d);
+          // Look at the most recent previously-generated day (within the last
+          // ~14 days) to decide whether to generate ahead.
+          let gate = true; // default: allowed (first run or nothing recent)
+          const recentKeys = [];
+          for (let i = 1; i <= 14; i++) recentKeys.push(`daily:${kidId}:${dateKeyPlus(-i)}`);
+          const recent = await store.mget(recentKeys);
+          let latest = null;
+          for (const k of recentKeys) { // recentKeys is newest-first
+            if (dayHasQuestions(recent[k])) { latest = recent[k]; break; }
+          }
+          if (latest) {
+            const prog = dayProgress(latest);
+            gate = prog.total === 0 || prog.answered / prog.total >= REGEN_THRESHOLD;
+          }
+
+          if (gate) {
+            // Generate today + the next (DAYS_AHEAD-1) days that don't exist yet.
+            const futureKeys = Array.from({ length: DAYS_AHEAD }, (_, i) => `daily:${kidId}:${dateKeyPlus(i)}`);
+            const existing = await store.mget(futureKeys);
+            const built = await buildDaysAhead(kid.grade, kid, DAYS_AHEAD);
+            await Promise.all(
+              futureKeys.map((k, i) => {
+                if (dayHasQuestions(existing[k])) return null; // keep any in-progress future day
+                return store.set(k, built[i]);
+              })
+            );
+            d = (await store.get(dayKeyName)) || built[0];
+          } else {
+            // Not enough of the last set was done — just make sure TODAY exists.
+            d = await buildDay(kid.grade, kid);
+            await store.set(dayKeyName, d);
+          }
         } finally {
           setDayLoading(false);
         }
@@ -1389,6 +1689,69 @@ export default function App() {
     setChoreLog(next);
     if (activeKid) await store.set(`chore-log:${activeKid}:${date}`, next);
   };
+
+  // When a parent changes a kid's categories/counts: top up TODAY's set to match
+  // the new counts (add new questions per subject, keep existing answers; trim
+  // extras only from the unanswered tail), and clear untouched FUTURE pre-built
+  // days so they regenerate with the new settings.
+  const applySettingsChange = useCallback(async (updatedKid) => {
+    if (!updatedKid || !updatedKid.id) return;
+    const kidId = updatedKid.id;
+
+    // 1) Reconcile today's day in place.
+    const dayKeyName = `daily:${kidId}:${date}`;
+    const today = await store.get(dayKeyName);
+    if (dayHasQuestions(today)) {
+      const next = { ...today };
+      // Build a fresh "ideal" day to source brand-new questions from.
+      const fresh = await buildDay(updatedKid.grade, updatedKid);
+      for (const s of SUBJECTS) {
+        const want = countFor(s.key, updatedKid);
+        const cur = Array.isArray(next[s.key]) ? next[s.key].slice() : [];
+        if (want === 0) { next[s.key] = []; continue; }
+        if (cur.length < want) {
+          // add new questions from the fresh set (skip dupes by question text)
+          const have = new Set(cur.map((it) => it.q));
+          const pool = (fresh[s.key] || []).filter((it) => !have.has(it.q));
+          let pi = 0;
+          while (cur.length < want && pi < pool.length) cur.push(pool[pi++]);
+          // if still short (pool too small), generate procedurally
+          const genFn = (SUBJECTS.find((x) => x.key === s.key) || {}).gen;
+          let guard = 0;
+          while (cur.length < want && genFn && guard < 300) {
+            guard++;
+            const it = blankItem(genFn(updatedKid.grade));
+            if (!have.has(it.q)) { have.add(it.q); cur.push(it); }
+          }
+          next[s.key] = cur;
+        } else if (cur.length > want) {
+          // trim from the END, but never remove an answered question
+          const trimmed = cur.slice();
+          while (trimmed.length > want) {
+            const last = trimmed[trimmed.length - 1];
+            if (last && (last.response || last.checked)) break; // keep answered tail
+            trimmed.pop();
+          }
+          next[s.key] = trimmed;
+        }
+      }
+      await store.set(dayKeyName, next);
+      if (kidId === activeKid) setDay(next);
+    }
+
+    // 2) Clear untouched future pre-generated days so they rebuild fresh.
+    const futureKeys = Array.from({ length: 14 }, (_, i) => `daily:${kidId}:${dateKeyPlus(i + 1)}`);
+    const future = await store.mget(futureKeys);
+    await Promise.all(
+      futureKeys.map((k) => {
+        const fd = future[k];
+        if (!fd) return null;
+        const prog = dayProgress(fd);
+        if (prog.answered === 0) return store.set(k, {}); // untouched -> clear so it regenerates
+        return null; // leave a day they've already started
+      })
+    );
+  }, [date, activeKid]);
 
   /* ---------- reward game: all questions correct + all today's chores done ---------- */
   // Only consider subjects that actually have questions today (a parent can set
@@ -1594,6 +1957,9 @@ export default function App() {
           setUnlocked={setParentUnlocked}
           onExitParent={() => setParentMode(false)}
           onRenamed={setFamilyName}
+          onSettingsChanged={applySettingsChange}
+          familyName={familyName}
+          onEnterKidMode={enterKidMode}
         />
       ) : !kid ? (
         parent ? (
@@ -2346,8 +2712,8 @@ function TabBar({ tab, setTab }) {
 }
 
 /* --------------------------- onboarding wizard -------------------------- */
-function OnboardingWizard({ refreshKids, setActiveKid, familyName, onRenamed }) {
-  const [step, setStep] = useState(0);
+function OnboardingWizard({ refreshKids, setActiveKid, familyName, onRenamed, startStep = 0, onDone }) {
+  const [step, setStep] = useState(startStep);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
 
@@ -2356,14 +2722,14 @@ function OnboardingWizard({ refreshKids, setActiveKid, familyName, onRenamed }) 
   const [name, setName] = useState("");
   const [grade, setGrade] = useState(1);
   const [selected, setSelected] = useState(() => {
-    // default: all built-in categories on
+    // default: all built-in topics on
     const s = {};
     for (const subj of SUBJECTS) s[subj.key] = [...(SUBJECT_CATEGORIES[subj.key] || [])];
     return s;
   });
   const [counts, setCounts] = useState(() => {
     const c = {};
-    for (const subj of SUBJECTS) c[subj.key] = 10;
+    for (const subj of SUBJECTS) c[subj.key] = DEFAULT_SUBJECTS.includes(subj.key) ? 10 : 0;
     return c;
   });
   const [chores, setChores] = useState(() => DEFAULT_CHORES.map((c) => ({ id: uid(), title: c.title, days: c.days.slice() })));
@@ -2381,6 +2747,19 @@ function OnboardingWizard({ refreshKids, setActiveKid, familyName, onRenamed }) 
     if (!Number.isFinite(n)) n = 0;
     n = Math.max(0, Math.min(20, n));
     setCounts((c) => ({ ...c, [subj]: n }));
+  };
+
+  // Subjects are freely chosen (1–10). Enable = count 10 + all topics selected;
+  // disable = count 0 (but keep at least one subject on).
+  const chosenSubjectCount = () => SUBJECTS.filter((s) => (counts[s.key] ?? 0) > 0).length;
+  const addOptional = (key, currentCount) => {
+    if (currentCount >= MAX_SUBJECTS) return;
+    setCounts((c) => ({ ...c, [key]: 10 }));
+    setSelected((s) => ({ ...s, [key]: [...(SUBJECT_CATEGORIES[key] || [])] }));
+  };
+  const removeOptional = (key) => {
+    if (chosenSubjectCount() <= MIN_SUBJECTS) return;
+    setCounts((c) => ({ ...c, [key]: 0 }));
   };
 
   const next = () => setStep((s) => s + 1);
@@ -2401,7 +2780,7 @@ function OnboardingWizard({ refreshKids, setActiveKid, familyName, onRenamed }) 
     for (const subj of SUBJECTS) s[subj.key] = [...(SUBJECT_CATEGORIES[subj.key] || [])];
     setSelected(s);
     const c = {};
-    for (const subj of SUBJECTS) c[subj.key] = 10;
+    for (const subj of SUBJECTS) c[subj.key] = DEFAULT_SUBJECTS.includes(subj.key) ? 10 : 0;
     setCounts(c);
     setChores(DEFAULT_CHORES.map((ch) => ({ id: uid(), title: ch.title, days: ch.days.slice() })));
     setNewChore("");
@@ -2423,10 +2802,14 @@ function OnboardingWizard({ refreshKids, setActiveKid, familyName, onRenamed }) 
           if (onRenamed) onRenamed((r && r.name) || famName.trim());
         } catch {}
       }
-      const ks = await api.createKid(name.trim(), Number(grade));
-      const created = ks[ks.length - 1];
-      if (!created) throw new Error("Could not create the child profile.");
-      await api.updateKid(created.id, { categories: { selected, custom: {} }, counts });
+      // Create the child WITH categories + counts in one atomic write, then
+      // save chores. This avoids a create-then-update sequence that could fail
+      // on eventually-consistent storage ("Child not found").
+      const { kid: created } = await api.createKid(name.trim(), Number(grade), {
+        categories: { selected, custom: {} },
+        counts,
+      });
+      if (!created || !created.id) throw new Error("Could not create the child profile.");
       await store.set(`chores:${created.id}`, chores);
       if (!firstKidId) setFirstKidId(created.id);
       setLastKidName(name.trim());
@@ -2439,12 +2822,14 @@ function OnboardingWizard({ refreshKids, setActiveKid, familyName, onRenamed }) 
     }
   };
 
-  // Done adding kids — hand off to the app (selecting a kid generates questions).
+  // Done adding kids — hand off to the app (selecting a kid generates questions),
+  // or return to the caller (e.g. parent panel) if onDone was provided.
   const finishAll = async () => {
     setBusy(true);
     try {
-      await refreshKids();
+      const ks = await refreshKids();
       if (firstKidId) setActiveKid(firstKidId);
+      if (onDone) onDone(firstKidId, ks);
     } catch (e) {
       setErr(e.message || "Something went wrong. Please try again.");
       setBusy(false);
@@ -2465,7 +2850,7 @@ function OnboardingWizard({ refreshKids, setActiveKid, familyName, onRenamed }) 
         <div style={{ display: "flex", flexDirection: "column", gap: 10, margin: "16px 0" }}>
           {[
             ["📚", "Daily questions", "A fresh set of questions every day across Math, Reading & Writing, Science, History, and Geography — with instant, kid-friendly grading and gentle hints."],
-            ["🎯", "You choose the topics", "Pick exactly which topics each child practices, and how many questions per subject (0–20). Math includes visual questions like graphs and shapes."],
+            ["🎯", "You choose the subjects", "Pick 1–10 subjects per child and the topics within each, plus how many questions per subject. Math includes visual questions like graphs and shapes."],
             ["🎓", "Grade levels", "Set each child's grade so questions are the right difficulty."],
             ["🧹", "Chores tracker", "Add chores and choose which days they appear. Kids check them off each day."],
             ["🎮", "Reward game", "When a child gets everything right and finishes their chores, they unlock a fun mini-game — plus celebration pop-ups."],
@@ -2507,48 +2892,85 @@ function OnboardingWizard({ refreshKids, setActiveKid, familyName, onRenamed }) 
         </select>
         {err && <div style={errBox}>{err}</div>}
         <div style={{ display: "flex", gap: 10, marginTop: 18 }}>
-          <button style={{ ...btnGhost, flex: 1 }} onClick={() => (addedCount > 0 ? setStep(4) : back())}>← Back</button>
+          <button style={{ ...btnGhost, flex: 1 }} onClick={() => (addedCount > 0 ? setStep(4) : (onDone ? onDone(null) : back()))}>{addedCount > 0 ? "← Back" : (onDone ? "Cancel" : "← Back")}</button>
           <button style={{ ...btnPrimary, flex: 2, marginTop: 0, opacity: name.trim() ? 1 : 0.5 }} disabled={!name.trim()} onClick={next}>Next: pick topics →</button>
         </div>
       </div>
     );
   }
 
-  // ---------- Step 2: Categories + counts ----------
+  // ---------- Step 2: Subjects + topics + counts ----------
   if (step === 2) {
+    const chosenCount = SUBJECTS.filter((s) => (counts[s.key] ?? 0) > 0).length;
+    const renderSubject = (subj) => {
+      const cats = SUBJECT_CATEGORIES[subj.key] || [];
+      const sel = new Set(selected[subj.key] || []);
+      const cnt = counts[subj.key] ?? 0;
+      return (
+        <div key={subj.key} style={{ padding: "12px 0", borderBottom: "1px solid #f0ecf6" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, flexWrap: "wrap", marginBottom: 8 }}>
+            <h3 className="sq-h" style={{ margin: 0, fontSize: 17, color: subj.color }}>{subj.key}</h3>
+            <div style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+              <label style={{ fontSize: 13, color: "#7a6f8c", fontWeight: 700, display: "inline-flex", alignItems: "center", gap: 6 }}>
+                Questions/day:
+                <input type="number" min={1} max={20} value={cnt} onChange={(e) => setCount(subj.key, e.target.value)} style={{ ...input, margin: 0, width: 64, padding: "6px 8px", textAlign: "center" }} />
+              </label>
+              <button
+                title={chosenCount <= MIN_SUBJECTS ? `Keep at least ${MIN_SUBJECTS} subject` : "Remove this subject"}
+                onClick={() => removeOptional(subj.key)}
+                disabled={chosenCount <= MIN_SUBJECTS}
+                style={{ border: "none", background: "none", color: chosenCount <= MIN_SUBJECTS ? "#d8cfe4" : "#e0506b", cursor: chosenCount <= MIN_SUBJECTS ? "default" : "pointer", fontWeight: 800, fontSize: 16 }}
+              >✕</button>
+            </div>
+          </div>
+          <div style={{ fontSize: 12, color: "#9a8fb0", marginBottom: 6, fontWeight: 700 }}>Topics</div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+            {cats.map((cat) => {
+              const on = sel.has(cat);
+              return (
+                <button key={cat} onClick={() => toggleCat(subj.key, cat)} style={{ ...chip, fontSize: 13, padding: "7px 12px", background: on ? subj.color : "#fff", color: on ? "#fff" : "#6a5f7e", borderColor: on ? subj.color : "#e3dcec" }}>
+                  {on ? "✓ " : ""}{cat}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      );
+    };
+
+    const chosen = SUBJECTS.filter((s) => (counts[s.key] ?? 0) > 0);
+
     return (
       <div className="sq-card" style={card}>
         <WizardHeader step={2} total={4} title={`What should ${name || "your child"} practice?`} emoji="🎯" />
-        <p style={{ color: "#7a6f8c", marginTop: -6 }}>Tap topics to turn them on or off, and set how many questions per subject (0 skips it). You can change all of this later.</p>
-        {SUBJECTS.map((subj) => {
-          const cats = SUBJECT_CATEGORIES[subj.key] || [];
-          const sel = new Set(selected[subj.key] || []);
-          return (
-            <div key={subj.key} style={{ padding: "12px 0", borderBottom: "1px solid #f0ecf6" }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, flexWrap: "wrap", marginBottom: 8 }}>
-                <h3 className="sq-h" style={{ margin: 0, fontSize: 17, color: subj.color }}>{subj.key}</h3>
-                <label style={{ fontSize: 13, color: "#7a6f8c", fontWeight: 700, display: "inline-flex", alignItems: "center", gap: 6 }}>
-                  Questions/day:
-                  <input type="number" min={0} max={20} value={counts[subj.key] ?? 10} onChange={(e) => setCount(subj.key, e.target.value)} style={{ ...input, margin: 0, width: 64, padding: "6px 8px", textAlign: "center" }} />
-                </label>
-              </div>
-              <div style={{ display: "flex", flexWrap: "wrap", gap: 8, opacity: (counts[subj.key] ?? 10) === 0 ? 0.4 : 1 }}>
-                {cats.map((cat) => {
-                  const on = sel.has(cat);
-                  return (
-                    <button
-                      key={cat}
-                      onClick={() => toggleCat(subj.key, cat)}
-                      style={{ ...chip, fontSize: 13, padding: "7px 12px", background: on ? subj.color : "#fff", color: on ? "#fff" : "#6a5f7e", borderColor: on ? subj.color : "#e3dcec" }}
-                    >
-                      {on ? "✓ " : ""}{cat}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-          );
-        })}
+        <p style={{ color: "#7a6f8c", marginTop: -6 }}>Choose {MIN_SUBJECTS}–{MAX_SUBJECTS} subjects, pick the topics in each, and set how many questions per subject. You can change all of this later.</p>
+
+        {/* Subject chooser */}
+        <div style={{ marginBottom: 6, padding: 14, background: "#faf8fd", borderRadius: 12, border: "1px solid #efeaf7" }}>
+          <div className="sq-h" style={{ fontWeight: 800, color: "#4a3f5e", marginBottom: 4 }}>
+            Choose subjects <span style={{ fontSize: 13, color: "#9a8fb0", fontWeight: 600 }}>({chosenCount}/{MAX_SUBJECTS})</span>
+          </div>
+          <p style={{ fontSize: 13, color: "#7a6f8c", margin: "0 0 8px" }}>Tap to turn a subject on or off. At least {MIN_SUBJECTS} must stay on.</p>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+            {SUBJECTS.map((s) => {
+              const on = (counts[s.key] ?? 0) > 0;
+              const lockOff = on && chosenCount <= MIN_SUBJECTS;
+              return (
+                <button
+                  key={s.key}
+                  onClick={() => (on ? removeOptional(s.key) : addOptional(s.key, chosenCount))}
+                  disabled={(!on && chosenCount >= MAX_SUBJECTS) || lockOff}
+                  style={{ ...chip, fontSize: 13, padding: "8px 14px", background: on ? s.color : "#fff", color: on ? "#fff" : s.color, borderColor: s.color, opacity: (!on && chosenCount >= MAX_SUBJECTS) ? 0.4 : 1, cursor: lockOff ? "default" : "pointer" }}
+                >
+                  {on ? "✓ " : "+ "}{s.key}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        {chosen.map(renderSubject)}
+
         <div style={{ display: "flex", gap: 10, marginTop: 18 }}>
           <button style={{ ...btnGhost, flex: 1 }} onClick={back}>← Back</button>
           <button style={{ ...btnPrimary, flex: 2, marginTop: 0 }} onClick={next}>Next: chores →</button>
@@ -3700,18 +4122,47 @@ function CalendarView({ kid, date }) {
   });
   const [data, setData] = useState({}); // dateKey -> { q?, ch? }
   const [loading, setLoading] = useState(false);
+  // cache loaded months per kid so flipping back and forth is instant
+  const cacheRef = useRef({}); // `${kidId}:${y}-${m}` -> map
 
   useEffect(() => {
     let cancelled = false;
-    (async () => {
+    const cacheKey = `${kid.id}:${cursor.y}-${cursor.m}`;
+
+    // Show cached month immediately if we have it (still refresh in background
+    // only for the current month, which can change as the kid works today).
+    const cached = cacheRef.current[cacheKey];
+    const isCurrentMonth = (() => {
+      const now = new Date();
+      return now.getFullYear() === cursor.y && now.getMonth() === cursor.m;
+    })();
+    if (cached) {
+      setData(cached);
+      if (!isCurrentMonth) return; // past months never change — no refetch
+    } else {
       setLoading(true);
+    }
+
+    (async () => {
       const days = daysInMonth(cursor.y, cursor.m);
-      const map = {};
+      const dayKeys = [];
+      const qKeys = [];
+      const chKeys = [];
       for (let dn = 1; dn <= days; dn++) {
         const key = `${cursor.y}-${String(cursor.m + 1).padStart(2, "0")}-${String(dn).padStart(2, "0")}`;
+        dayKeys.push(key);
+        qKeys.push(`daily:${kid.id}:${key}`);
+        chKeys.push(`chore-log:${kid.id}:${key}`);
+      }
 
-        // Questions
-        const d = await store.get(`daily:${kid.id}:${key}`);
+      // ONE request for the whole month (both questions + chores) instead of
+      // dozens of sequential round-trips.
+      const values = await store.mget([...qKeys, ...chKeys]);
+      if (cancelled) return;
+
+      const map = {};
+      for (const key of dayKeys) {
+        const d = values[`daily:${kid.id}:${key}`];
         if (d) {
           let right = 0, total = 0, checked = 0;
           for (const subj of SUBJECTS.map((s) => s.key)) {
@@ -3724,9 +4175,7 @@ function CalendarView({ kid, date }) {
           }
           if (total > 0) map[key] = { ...(map[key] || {}), q: { right, total, checked } };
         }
-
-        // Chores (only count chores that were actually scheduled/answered that day)
-        const log = await store.get(`chore-log:${kid.id}:${key}`);
+        const log = values[`chore-log:${kid.id}:${key}`];
         if (log && typeof log === "object") {
           const vals = Object.values(log);
           const count = vals.length;
@@ -3737,6 +4186,8 @@ function CalendarView({ kid, date }) {
           }
         }
       }
+
+      cacheRef.current[cacheKey] = map;
       if (!cancelled) {
         setData(map);
         setLoading(false);
@@ -3835,7 +4286,7 @@ function Legend({ c, t }) {
 const daysInMonth = (y, m) => new Date(y, m + 1, 0).getDate();
 
 /* ============================ PARENT PANEL ============================ */
-function ParentPanel({ parent, setParent, kids, refreshKids, activeKid, setActiveKid, date, unlocked, setUnlocked, onExitParent, onRenamed }) {
+function ParentPanel({ parent, setParent, kids, refreshKids, activeKid, setActiveKid, date, unlocked, setUnlocked, onExitParent, onRenamed, onSettingsChanged, familyName, onEnterKidMode }) {
   const [pw, setPw] = useState("");
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
@@ -3880,7 +4331,7 @@ function ParentPanel({ parent, setParent, kids, refreshKids, activeKid, setActiv
 
   const sections = [
     ["kids", "👧 Kids & Grades"],
-    ["categories", "🎯 Categories"],
+    ["categories", "🎯 Subjects"],
     ["chores", "🧹 Chores Setup"],
     ["answers", "🔑 Answer Keys"],
     ["family", "👨‍👩‍👧 Family"],
@@ -3912,11 +4363,11 @@ function ParentPanel({ parent, setParent, kids, refreshKids, activeKid, setActiv
         ))}
       </div>
 
-      {section === "kids" && <KidsManager kids={kids} refreshKids={refreshKids} activeKid={activeKid} setActiveKid={setActiveKid} />}
-      {section === "categories" && <CategoriesManager kids={kids} refreshKids={refreshKids} activeKid={activeKid} setActiveKid={setActiveKid} />}
+      {section === "kids" && <KidsManager kids={kids} refreshKids={refreshKids} activeKid={activeKid} setActiveKid={setActiveKid} familyName={familyName} onRenamed={onRenamed} onSettingsChanged={onSettingsChanged} />}
+      {section === "categories" && <CategoriesManager kids={kids} refreshKids={refreshKids} activeKid={activeKid} setActiveKid={setActiveKid} onSettingsChanged={onSettingsChanged} />}
       {section === "chores" && <ChoresManager kids={kids} activeKid={activeKid} setActiveKid={setActiveKid} />}
       {section === "answers" && <AnswerKey kids={kids} date={date} />}
-      {section === "family" && <FamilyManager onRenamed={onRenamed} />}
+      {section === "family" && <FamilyManager onRenamed={onRenamed} onEnterKidMode={onEnterKidMode} />}
       {section === "notifications" && <NotificationsManager />}
       {section === "account" && <AccountManager parent={parent} setParent={setParent} />}
       {section === "admin" && parent && parent.isAdmin && <AdminPanel meUsername={parent.username} />}
@@ -4039,7 +4490,7 @@ function NotificationsManager() {
   );
 }
 
-function FamilyManager({ onRenamed }) {
+function FamilyManager({ onRenamed, onEnterKidMode }) {
   const [info, setInfo] = useState(null); // { code, name, members }
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
@@ -4047,6 +4498,8 @@ function FamilyManager({ onRenamed }) {
   const [nameInput, setNameInput] = useState("");
   const [nameSaved, setNameSaved] = useState(false);
   const [nameBusy, setNameBusy] = useState(false);
+  const [kidModeBusy, setKidModeBusy] = useState(false);
+  const [kidModeErr, setKidModeErr] = useState("");
 
   const load = async () => {
     setErr("");
@@ -4169,6 +4622,33 @@ function FamilyManager({ onRenamed }) {
             {copied === "link" ? "✓ Copied" : "📋 Copy link"}
           </button>
         </div>
+        {onEnterKidMode && (
+          <div style={{ marginTop: 12, paddingTop: 12, borderTop: "1px dashed #cdeccf" }}>
+            <p style={{ fontSize: 13, color: "#4f6f58", margin: "0 0 8px" }}>
+              <strong>On your child's own tablet?</strong> Tap below to turn <em>this</em> installed app into your kids' app.
+              It will open straight to your family every time — no link to copy and no password. You'll log out of the
+              parent account on this device (tap the 🔒 lock anytime to log back in).
+            </p>
+            {kidModeErr && <div style={errBox}>{kidModeErr}</div>}
+            <button
+              style={{ ...btnPrimary, marginTop: 0, background: "#2fa84f", opacity: kidModeBusy ? 0.6 : 1 }}
+              disabled={kidModeBusy}
+              onClick={async () => {
+                if (!confirm("Turn this device into your kids' app? It will open straight to your family with no login, and you'll be logged out of the parent account here (you can log back in anytime with the lock button).")) return;
+                setKidModeErr("");
+                setKidModeBusy(true);
+                try {
+                  await onEnterKidMode();
+                } catch (e) {
+                  setKidModeErr(e.message || "Could not switch to Kids Mode.");
+                  setKidModeBusy(false);
+                }
+              }}
+            >
+              {kidModeBusy ? "Switching…" : "🧒 Switch this device to Kids Mode"}
+            </button>
+          </div>
+        )}
       </div>
 
       {/* Co-parent invite link */}
@@ -4384,6 +4864,18 @@ function AdminPanel({ meUsername }) {
     } finally { setBusy(""); }
   };
 
+  const cleanup = async () => {
+    setMsg(""); setErr(""); setBusy("cleanup");
+    try {
+      const r = await api.adminCleanupFamilies();
+      const n = (r && r.removed) || 0;
+      setMsg(n > 0 ? `Removed ${n} orphaned famil${n === 1 ? "y" : "ies"} with no parents.` : "No orphaned families found — everything's clean.");
+      await load();
+    } catch (e) {
+      setErr(e.message || "Could not clean up families.");
+    } finally { setBusy(""); }
+  };
+
   if (data === null) return <div className="sq-card" style={panel}><p style={{ color: "#7a6f8c" }}>Loading accounts…</p></div>;
 
   // group users by family
@@ -4421,6 +4913,12 @@ function AdminPanel({ meUsername }) {
       <p style={{ color: "#7a6f8c", marginTop: -8 }}>
         Add or remove parents per family. For security, you can't set passwords directly — use “Send reset link” (or adding a user emails them a set-password link). Passwords are only ever set by the user from their emailed link.
       </p>
+      <div style={{ marginBottom: 12 }}>
+        <button style={{ ...btnGhost, borderColor: "#e0506b", color: "#e0506b" }} disabled={!!busy} onClick={cleanup}>
+          {busy === "cleanup" ? "Cleaning…" : "🧹 Clean up orphaned families"}
+        </button>
+        <span style={{ fontSize: 12, color: "#9a8fb0", marginLeft: 8 }}>Families with no parents are also removed automatically.</span>
+      </div>
       {err && <div style={errBox}>{err}</div>}
       {msg && <div style={{ ...errBox, background: "#eefaf0", color: "#2fa84f" }}>{msg}</div>}
 
@@ -4650,7 +5148,7 @@ function LogViewer() {
 }
 
 /* -------------------------- categories manager -------------------------- */
-function CategoriesManager({ kids, refreshKids, activeKid, setActiveKid }) {
+function CategoriesManager({ kids, refreshKids, activeKid, setActiveKid, onSettingsChanged }) {
   const kid = kids.find((k) => k.id === activeKid) || kids[0] || null;
 
   // local editable copy of THIS kid's category prefs
@@ -4681,7 +5179,12 @@ function CategoriesManager({ kids, refreshKids, activeKid, setActiveKid }) {
       // default: everything (built-in + this kid's custom) selected
       sel[s.key] = Array.isArray(stored) ? stored.slice() : [...builtIn, ...cus[s.key]];
       const c = kidCounts && kidCounts[s.key];
-      cnt[s.key] = Number.isFinite(Number(c)) ? Math.max(0, Math.min(20, Math.round(Number(c)))) : 10;
+      // null/undefined/"" means "not set". For a brand-new kid (no saved counts
+      // at all), default subjects start at 10 and the rest at 0; once any counts
+      // are saved, an unset subject is off (0). An explicit number is used as-is.
+      const hasAnyCounts = kidCounts && Object.keys(kidCounts).length > 0;
+      const dflt = hasAnyCounts ? 0 : (DEFAULT_SUBJECTS.includes(s.key) ? 10 : 0);
+      cnt[s.key] = c == null || c === "" ? dflt : Math.max(0, Math.min(20, Math.round(Number(c)) || 0));
     }
     setSelected(sel);
     setCustom(cus);
@@ -4727,12 +5230,32 @@ function CategoriesManager({ kids, refreshKids, activeKid, setActiveKid }) {
     setCounts((c) => ({ ...c, [subject]: n }));
   };
 
+  // Subjects are freely chosen (1–10). A subject is "on" when its count >= 1.
+  const chosenCount = () => SUBJECTS.filter((s) => (counts[s.key] ?? 0) > 0).length;
+  const enableSubject = (key) => {
+    if (chosenCount() >= MAX_SUBJECTS) return;
+    setSaved(false);
+    setCounts((c) => ({ ...c, [key]: 10 }));
+    // make sure topics are selected (default to all built-in for this subject)
+    setSelected((s) => ({ ...s, [key]: s[key] && s[key].length ? s[key] : [...(SUBJECT_CATEGORIES[key] || [])] }));
+  };
+  const disableSubject = (key) => {
+    if (chosenCount() <= MIN_SUBJECTS) return; // keep at least one subject on
+    setSaved(false);
+    setCounts((c) => ({ ...c, [key]: 0 }));
+  };
+
   const save = async () => {
     if (!kid) return;
     setBusy(true);
     try {
       const ks = await api.updateKid(kid.id, { categories: { selected, custom }, counts });
       await refreshKids(ks);
+      // Apply the new settings to questions: top up today's set if counts grew
+      // (keeping existing answers), and clear untouched future days so they
+      // regenerate with the new categories/counts.
+      const updatedKid = ks.find((k) => k.id === kid.id) || { ...kid, categories: { selected, custom }, counts };
+      if (onSettingsChanged) await onSettingsChanged(updatedKid);
       setSaved(true);
     } finally {
       setBusy(false);
@@ -4741,13 +5264,48 @@ function CategoriesManager({ kids, refreshKids, activeKid, setActiveKid }) {
 
   return (
     <div className="sq-card" style={panel}>
-      <h2 className="sq-h" style={{ ...h2, marginTop: 0 }}>Question Categories</h2>
+      <h2 className="sq-h" style={{ ...h2, marginTop: 0 }}>Subjects</h2>
       <p style={{ color: "#7a6f8c", marginTop: -8 }}>
-        Pick which topics to include in {kid ? kid.name + "'s" : "the"} questions each day, and how many questions each subject gets (0–20; set 0 to skip a subject). Changes apply to the next day's set.
+        Choose between {MIN_SUBJECTS} and {MAX_SUBJECTS} subjects for {kid ? kid.name : "this child"}, pick the topics within each, and set how many questions each subject gets per day (1–20). Changes apply to the next day's set.
       </p>
       <KidPicker kids={kids} activeKid={kid ? kid.id : null} setActiveKid={setActiveKid} />
 
-      {SUBJECTS.map((s) => {
+      {/* Subject chooser: turn any of the subjects on/off (1–10). */}
+      <div style={{ marginTop: 6, marginBottom: 6, padding: 14, background: "#faf8fd", borderRadius: 12, border: "1px solid #efeaf7" }}>
+        <div className="sq-h" style={{ fontWeight: 800, color: "#4a3f5e", marginBottom: 4 }}>
+          Choose subjects <span style={{ fontSize: 13, color: "#9a8fb0", fontWeight: 600 }}>({chosenCount()}/{MAX_SUBJECTS})</span>
+        </div>
+        <p style={{ fontSize: 13, color: "#7a6f8c", margin: "0 0 8px" }}>Tap to turn a subject on or off. At least {MIN_SUBJECTS} must stay on.</p>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+          {SUBJECTS.map((s) => {
+            const on = (counts[s.key] ?? 0) > 0;
+            const lockOff = on && chosenCount() <= MIN_SUBJECTS; // can't turn off the last one
+            return (
+              <button
+                key={s.key}
+                onClick={() => (on ? disableSubject(s.key) : enableSubject(s.key))}
+                disabled={(!on && chosenCount() >= MAX_SUBJECTS) || lockOff}
+                title={lockOff ? `Keep at least ${MIN_SUBJECTS} subject` : on ? `Turn off ${s.key}` : `Turn on ${s.key}`}
+                style={{
+                  ...chip,
+                  fontSize: 13,
+                  padding: "8px 14px",
+                  background: on ? s.color : "#fff",
+                  color: on ? "#fff" : s.color,
+                  borderColor: s.color,
+                  opacity: (!on && chosenCount() >= MAX_SUBJECTS) ? 0.4 : 1,
+                  cursor: lockOff ? "default" : "pointer",
+                }}
+              >
+                {on ? "✓ " : "+ "}{s.key}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Per-subject topics + question count, for the chosen subjects only. */}
+      {SUBJECTS.filter((s) => (counts[s.key] ?? 0) > 0).map((s) => {
         const builtIn = SUBJECT_CATEGORIES[s.key] || [];
         const customCats = custom[s.key] || [];
         const all = [...builtIn, ...customCats];
@@ -4757,19 +5315,30 @@ function CategoriesManager({ kids, refreshKids, activeKid, setActiveKid }) {
           <div key={s.key} style={{ padding: "14px 0", borderBottom: "1px solid #f0ecf6" }}>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, flexWrap: "wrap", marginBottom: 10 }}>
               <h3 className="sq-h" style={{ margin: 0, fontSize: 18, color: s.color }}>{s.key}</h3>
-              <label style={{ display: "inline-flex", alignItems: "center", gap: 6, fontSize: 13, color: "#7a6f8c", fontWeight: 700 }}>
-                Questions/day:
-                <input
-                  type="number"
-                  min={0}
-                  max={20}
-                  value={counts[s.key] ?? 10}
-                  onChange={(e) => setCount(s.key, e.target.value)}
-                  style={{ ...input, margin: 0, width: 64, padding: "6px 8px", textAlign: "center" }}
-                />
-              </label>
+              <div style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+                <label style={{ display: "inline-flex", alignItems: "center", gap: 6, fontSize: 13, color: "#7a6f8c", fontWeight: 700 }}>
+                  Questions/day:
+                  <input
+                    type="number"
+                    min={1}
+                    max={20}
+                    value={counts[s.key] ?? 10}
+                    onChange={(e) => setCount(s.key, e.target.value)}
+                    style={{ ...input, margin: 0, width: 64, padding: "6px 8px", textAlign: "center" }}
+                  />
+                </label>
+                <button
+                  title={chosenCount() <= MIN_SUBJECTS ? `Keep at least ${MIN_SUBJECTS} subject` : `Remove ${s.key}`}
+                  onClick={() => disableSubject(s.key)}
+                  disabled={chosenCount() <= MIN_SUBJECTS}
+                  style={{ border: "none", background: "none", color: chosenCount() <= MIN_SUBJECTS ? "#d8cfe4" : "#e0506b", cursor: chosenCount() <= MIN_SUBJECTS ? "default" : "pointer", fontWeight: 800, fontSize: 16 }}
+                >
+                  ✕
+                </button>
+              </div>
             </div>
-            <div style={{ display: "flex", flexWrap: "wrap", gap: 8, opacity: (counts[s.key] ?? 10) === 0 ? 0.45 : 1 }}>
+            <div style={{ fontSize: 12, color: "#9a8fb0", marginBottom: 6, fontWeight: 700 }}>Topics</div>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
               {all.map((name) => {
                 const on = sel.has(name);
                 const isCustom = customCats.includes(name);
@@ -4789,7 +5358,7 @@ function CategoriesManager({ kids, refreshKids, activeKid, setActiveKid }) {
                     </button>
                     {isCustom && (
                       <button
-                        title="Remove custom category"
+                        title="Remove custom topic"
                         onClick={() => removeCustom(s.key, name)}
                         style={{ marginLeft: 2, marginRight: 4, border: "none", background: "none", color: "#e0506b", cursor: "pointer", fontWeight: 800 }}
                       >
@@ -4823,23 +5392,22 @@ function CategoriesManager({ kids, refreshKids, activeKid, setActiveKid }) {
 
       <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 16 }}>
         <button style={{ ...btnPrimary, marginTop: 0, opacity: busy ? 0.6 : 1 }} disabled={busy} onClick={save}>
-          {busy ? "Saving…" : "Save categories"}
+          {busy ? "Saving…" : "Save subjects"}
         </button>
         {saved && <span style={{ color: "#2fa84f", fontWeight: 700 }}>✓ Saved</span>}
       </div>
       <p style={{ fontSize: 12, color: "#9a8fb0", marginTop: 12 }}>
         ✦ Custom topics are created fresh by the AI teacher and need an internet connection. If a child has no
-        categories selected for a subject, all topics are used.
+        topics selected for a subject, all topics are used.
       </p>
     </div>
   );
 }
 
-function KidsManager({ kids, refreshKids, activeKid, setActiveKid }) {
-  const [name, setName] = useState("");
-  const [grade, setGrade] = useState(3);
+function KidsManager({ kids, refreshKids, activeKid, setActiveKid, familyName, onRenamed, onSettingsChanged }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
+  const [adding, setAdding] = useState(false); // show the add-a-kid wizard
   // Local authoritative copy of the list. We update it DIRECTLY from each API
   // response so the visible list changes the instant the server replies,
   // independent of parent re-render timing. Also kept in sync if props change.
@@ -4860,23 +5428,6 @@ function KidsManager({ kids, refreshKids, activeKid, setActiveKid }) {
     ks.forEach((k) => (map[k.id] = k.name));
     setNames(map);
     refreshKids(ks); // propagate to header switcher + the rest of the app
-  };
-
-  const add = async () => {
-    if (!name.trim()) return;
-    setErr("");
-    setBusy(true);
-    try {
-      const ks = await api.createKid(name.trim(), Number(grade));
-      const created = ks[ks.length - 1];
-      applyList(ks);
-      setName("");
-      if (created) setActiveKid(created.id);
-    } catch (e) {
-      setErr(e.message || "Could not add child.");
-    } finally {
-      setBusy(false);
-    }
   };
 
   const commitName = async (id) => {
@@ -4938,16 +5489,31 @@ function KidsManager({ kids, refreshKids, activeKid, setActiveKid }) {
         </div>
       ))}
 
-      <div style={{ marginTop: 18, padding: 16, background: "#f6f3fb", borderRadius: 14 }}>
-        <h3 className="sq-h" style={{ margin: "0 0 10px", fontSize: 18 }}>Add a child</h3>
-        <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-          <input style={{ ...input, margin: 0, maxWidth: 220 }} value={name} onChange={(e) => setName(e.target.value)} placeholder="Child's name" onKeyDown={(e) => e.key === "Enter" && add()} />
-          <label style={{ color: "#7a6f8c", fontWeight: 700 }}>Grade</label>
-          <select style={{ ...input, margin: 0, maxWidth: 90 }} value={grade} onChange={(e) => setGrade(e.target.value)}>
-            {Array.from({ length: 12 }).map((_, i) => <option key={i} value={i + 1}>{i + 1}</option>)}
-          </select>
-          <button style={{ ...btnPrimary, opacity: busy ? 0.6 : 1 }} disabled={busy} onClick={add}>{busy ? "Adding…" : "+ Add child"}</button>
-        </div>
+      <div style={{ marginTop: 18 }}>
+        {adding ? (
+          <div style={{ padding: 4 }}>
+            <OnboardingWizard
+              startStep={1}
+              refreshKids={refreshKids}
+              setActiveKid={setActiveKid}
+              familyName={familyName}
+              onRenamed={onRenamed}
+              onDone={(newKidId, ks) => {
+                setAdding(false);
+                if (Array.isArray(ks)) applyList(ks);
+                if (newKidId) setActiveKid(newKidId);
+              }}
+            />
+          </div>
+        ) : (
+          <div style={{ padding: 16, background: "#f6f3fb", borderRadius: 14, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
+            <div>
+              <h3 className="sq-h" style={{ margin: "0 0 4px", fontSize: 18 }}>Add a child</h3>
+              <p style={{ color: "#7a6f8c", margin: 0, fontSize: 14 }}>Set their grade, topics, question counts, and chores — then their questions are created.</p>
+            </div>
+            <button style={{ ...btnPrimary, marginTop: 0 }} onClick={() => { setErr(""); setAdding(true); }}>+ Add a child</button>
+          </div>
+        )}
       </div>
     </div>
   );
